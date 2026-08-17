@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autonomous Web Browser Agent (Kilo Server Edition)
 // @namespace    http://tampermonkey.net/
-// @version      8.13
+// @version      8.14
 // @updateURL    https://devproject.vip/apex-agent/apex_kilo_autonomous_agent.user.js
 // @downloadURL  https://devproject.vip/apex-agent/apex_kilo_autonomous_agent.user.js
 // @description  Full autonomous browser agent userscript for Tampermonkey. Deep Shadow DOM scanner, visual numbered badges, and LLM reasoning via the Kilo Code CLI server gateway (devproject.vip/ai), ported from Kilocode-Android2.
@@ -1332,6 +1332,53 @@
         return out;
     }
 
+    // Parse <tool_call> XML emitted by TOOL-CALLING models (e.g. poolside/laguna),
+    // which do NOT return JSON. Format observed in the wild:
+    //   <tool_call>scroll<arg_key>direction</arg_key><arg_value>down</arg_value><arg_key>elementId</arg_key><arg_value>6</arg_value></tool_call>
+    //   <tool_call>type<arg_key>elementId</arg_key><arg_value>5</arg_value><arg_key>text</arg_key><arg_value>hello</arg_value></tool_call>
+    // The action name is the leading text; each arg_key/arg_value pair becomes a
+    // field on the action object. Multiple <tool_call> blocks = an action sequence.
+    function extractToolCalls(text) {
+        const callRe = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
+        const out = [];
+        let m;
+        while ((m = callRe.exec(text)) !== null) {
+            const inner = m[1];
+            const firstKey = inner.indexOf('<arg_key>');
+            const namePart = (firstKey === -1 ? inner : inner.slice(0, firstKey)).trim();
+            // Action name may be "scroll", "click_element", "type_text", etc.
+            const action = namePart.replace(/[^\w]/g, '_').split('_')[0] || namePart;
+            const argRe = /<arg_key>([\s\S]*?)<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/gi;
+            const args = {};
+            let a;
+            while ((a = argRe.exec(inner)) !== null) {
+                const k = a[1].trim();
+                let v = a[2].trim();
+                if (/^-?\d+(\.\d+)?$/.test(v)) v = Number(v);
+                args[k] = v;
+            }
+            const obj = {};
+            // Map common arg names onto our executor schema.
+            for (const k of ['text', 'url', 'target', 'key', 'direction', 'durationMs']) {
+                if (args[k] !== undefined) obj[k] = args[k];
+            }
+            const elemRaw = args.elementId != null ? args.elementId : args.element_id;
+            if (elemRaw !== undefined && elemRaw !== null && elemRaw !== '') obj.elementId = Number(elemRaw);
+            if (args.toElementId !== undefined) obj.toElementId = Number(args.toElementId);
+            // A tool that supplies a "key" arg is a keyboard press -> 'key' action
+            // (e.g. press_key/key_press with key="Enter"). Otherwise normalize the
+            // tool name to one of our valid actions.
+            if (args.key !== undefined) {
+                obj.action = 'key';
+            } else {
+                const norm = normalizePlanAction(action);
+                obj.action = norm || action;
+            }
+            out.push(obj);
+        }
+        return out;
+    }
+
     // Pull the action value regardless of common key casings the model may emit.
     function getRawAction(obj) {
         if (!obj || typeof obj !== 'object') return undefined;
@@ -1385,6 +1432,23 @@
             }
         }
         if (allActions.length >= 1) return allActions.length === 1 ? allActions[0] : allActions;
+
+        // 3) Recover <tool_call> XML actions (tool-calling models like poolside/laguna
+        // emit these instead of JSON). Each <tool_call> becomes one action; several in
+        // a row form an ordered sequence. This is what lets those faster models work.
+        const toolActions = extractToolCalls(text);
+        if (toolActions.length) {
+            const valid = [];
+            for (const t of toolActions) {
+                const norm = normalizePlanAction(t.action);
+                if (!norm) continue;
+                t.action = norm;
+                if (!t.text && t.url != null) t.text = t.url;
+                if (t.toElementId == null && t.target != null && typeof t.target === 'number') t.toElementId = t.target;
+                valid.push(t);
+            }
+            if (valid.length) return valid.length === 1 ? valid[0] : valid;
+        }
         return null;
     }
 
