@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autonomous Web Browser Agent (Kilo Server Edition)
 // @namespace    http://tampermonkey.net/
-// @version      8.12
+// @version      8.13
 // @updateURL    https://devproject.vip/apex-agent/apex_kilo_autonomous_agent.user.js
 // @downloadURL  https://devproject.vip/apex-agent/apex_kilo_autonomous_agent.user.js
 // @description  Full autonomous browser agent userscript for Tampermonkey. Deep Shadow DOM scanner, visual numbered badges, and LLM reasoning via the Kilo Code CLI server gateway (devproject.vip/ai), ported from Kilocode-Android2.
@@ -75,7 +75,24 @@
         LLM_RETRIES: 3,
         // Per-plan LLM request timeout (ms). Kept tight so a slow/queued model fails
         // fast and the run surfaces a clear error instead of appearing "stuck".
+        // NOTE: the devproject 'kilo-auto/free' model commonly replies in 8-19s, so a
+        // value below that just triggers wasted retries. Set above the model's typical
+        // latency if you'd rather wait for a real answer than retry.
         PLAN_TIMEOUT_MS: 10000,
+        // Planner reasoning effort. Lower = fewer reasoning tokens = faster replies.
+        // 'low' is the default; 'none' (where the server supports it) skips reasoning
+        // entirely and is the fastest. Some servers reject 'none' with a 400 — if so,
+        // the run will surface that error and you should set this back to 'low'.
+        REASONING_EFFORT: 'low',
+        // Max characters of each element's text/name sent to the planner. Smaller =
+        // fewer input tokens = faster prefill. The executor re-scans the live DOM, so
+        // the planner only needs enough text to pick the right node.
+        ELEMENT_TEXT_LIMIT: 120,
+        // Create a FRESH short-lived session for EVERY step (default true). This keeps
+        // each request's input small but costs an extra ~0.5-2.6s POST /session per
+        // step. Set false to reuse ONE session across the whole run: saves that
+        // round-trip on every step, at the cost of growing context on very long runs.
+        SESSION_PER_STEP: true,
         // Hard wall-clock deadline (ms) for the ENTIRE run. No matter what, the agent
         // stops after this so it can never hang the tab forever. 0 = disabled.
         RUN_DEADLINE_MS: 180000,
@@ -1598,7 +1615,13 @@
         // the previous step's session to avoid leaking them.)
         let sessionId;
         try {
-            sessionId = await createKiloSession(config);
+            // Fresh session per step (default): keeps each request's input small, but
+            // costs an extra POST /session round-trip every step. When SESSION_PER_STEP
+            // is false we reuse ONE session for the whole run to skip that round-trip
+            // (faster per step; only a concern on very long runs where context grows).
+            sessionId = config.SESSION_PER_STEP
+                ? await createKiloSession(config)
+                : await ensureKiloSession(config);
         } catch (e) {
             addLog('ERR', `Planner session creation failed: ${e.message}. Is the OpenCode server running at ${config.KILO_AI_BASE}?`);
             throw e;
@@ -1610,6 +1633,7 @@
         const modelStr = (km && km !== 'kilo-auto/free' && km.includes('/')) ? km : '';
 
         const promptSystem = buildAgentSystemPrompt();
+        const txtLimit = (typeof config.ELEMENT_TEXT_LIMIT === 'number' && config.ELEMENT_TEXT_LIMIT > 0) ? config.ELEMENT_TEXT_LIMIT : 120;
 
         const userMessage = {
             goal,
@@ -1618,13 +1642,14 @@
             history: history.slice(-5),
             // Truncate verbose text/name so the input payload (and thus prefill time)
             // stays small — element IDs are preserved so the planner can still target them.
+            // 'pos' is dropped: the executor re-scans the live DOM, so the planner doesn't
+            // need viewport hints, and dropping it cuts tokens on every element.
             elements: tree.map(e => ({
                 id: e.id,
                 tag: e.tag,
                 role: e.role,
-                name: e.name ? String(e.name).slice(0, 160) : e.name,
-                text: e.text ? String(e.text).slice(0, 160) : e.text,
-                pos: e.pos
+                name: e.name ? String(e.name).slice(0, txtLimit) : e.name,
+                text: e.text ? String(e.text).slice(0, txtLimit) : e.text
             }))
         };
 
@@ -1665,7 +1690,7 @@
                     }
                     body = {
                         messageID: makeMsgId(),
-                        reasoningEffort: 'low',
+                        reasoningEffort: config.REASONING_EFFORT || 'low',
                         model: { providerID: pID, modelID: mID },
                         system: promptSystem,
                         parts: [{ type: 'text', text: JSON.stringify(userMessage) }]
@@ -1693,7 +1718,7 @@
                     body = {
                         messageID: makeMsgId(),
                         agent: 'apex-browser',
-                        reasoningEffort: 'low',
+                        reasoningEffort: config.REASONING_EFFORT || 'low',
                         model: { providerID: providerID, modelID: modelID },
                         parts: [{ type: 'text', text: 'You are the apex-browser planner. Respond with a single JSON plan object OR a JSON ARRAY of 2-4 action objects (no markdown, no code fences, no prose) using this schema: {thought, action, elementId, text, url, target, key, direction, durationMs, answer}. BATCHING RULE: when the goal requires multiple local UI steps on the same page, you MUST return them as ONE JSON ARRAY of action objects executed in order — e.g. [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."}] or [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."},{"action":"key","key":"Enter"}]. Combine "press a field" + "type text" into a single array instead of separate replies. Do NOT put a "navigate" or "done" action before other actions.\n\nUSER REQUEST:\n' + JSON.stringify(userMessage) }]
                     };
