@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autonomous Web Browser Agent (Kilo Server Edition)
 // @namespace    http://tampermonkey.net/
-// @version      8.10
+// @version      8.12
 // @updateURL    https://devproject.vip/apex-agent/apex_kilo_autonomous_agent.user.js
 // @downloadURL  https://devproject.vip/apex-agent/apex_kilo_autonomous_agent.user.js
 // @description  Full autonomous browser agent userscript for Tampermonkey. Deep Shadow DOM scanner, visual numbered badges, and LLM reasoning via the Kilo Code CLI server gateway (devproject.vip/ai), ported from Kilocode-Android2.
@@ -1527,7 +1527,7 @@
 
 ### CRITICAL RULES & CONSTRAINTS:
 1. **NO MCP SERVERS OR CODE EXECUTION**: You have no MCP servers, shell tools, or file system access. Do not attempt tool calls or search for external MCP tools.
-2. **OUTPUT FORMAT**: Respond ONLY with a single valid JSON object. No Markdown code fences (no \`\`\`json), no conversation, no markdown text before or after.
+2. **OUTPUT FORMAT**: Respond with a single valid JSON object OR a JSON ARRAY of 2-4 action objects. No Markdown code fences (no \`\`\`json), no conversation, no markdown text before or after.
 3. **ACTION SCHEMA**:
    Every response must adhere strictly to this schema:
    {
@@ -1551,7 +1551,8 @@
     - **Interactive Elements**: Always target the most accurate elementId from the provided interactive elements list.
     - **Touch & Drag**:
       - touch: tap a point on a touch interface. Target it the same way as click via elementId (use target for an explicit {x,y} coordinate).
-      - drag: press on elementId (the source), move to target (a destination elementId or {x,y} coordinates), then release. If elementId is absent, target is treated as the destination from the current pointer position.`;
+          - drag: press on elementId (the source), move to target (a destination elementId or {x,y} coordinates), then release. If elementId is absent, target is treated as the destination from the current pointer position.
+       - **ACTION SEQUENCES (BATCHING)**: When one logical operation needs multiple local UI steps on the SAME page, you MUST return them as a JSON ARRAY of action objects executed in order — NOT as separate replies. Examples: click a text field then type into it → [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."}]; or click + type + press Enter; or select a community then click the upload button. Combine "press a field" + "type text" into ONE array. Only the LAST action may be "done", and never put "navigate" before other actions (the page changes).`;
 
     function buildAgentSystemPrompt() {
         // The apex-browser agent's canonical prompt is the planner. We append a
@@ -1567,7 +1568,7 @@
 - If the GOAL is a Google search (e.g. "search <query>") and the current page is NOT google.com, use action "navigate" with url "https://www.google.com/search?q=<query>".
 - Do NOT fill unrelated forms (post/contact) when the goal is a search or different topic.
 - The request may include "lastActionVerification": your previous action did NOT land (e.g. field empty after type). Do NOT report done; retry a DIFFERENT way (click the field first, pick a different elementId, or type character-by-character) until the field visibly contains the text.
-- ACTION SEQUENCES: You MAY return a JSON ARRAY of 2-4 action objects (each following the schema above) when they form ONE logical operation on the same page — e.g. click the search box then type the query, or click a field, type, then press Enter. They are executed in order. Do NOT place a "navigate" or "done" action before other actions, because the page changes afterward.
+- ACTION SEQUENCES (BATCHING): When fulfilling the goal requires multiple local UI steps on the same page, you MUST return them as a SINGLE JSON ARRAY of 2-4 action objects executed in order — e.g. [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."}] or [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."},{"action":"key","key":"Enter"}]. Combine "press a textbox" + "type text" into ONE array instead of separate replies. Do NOT place a "navigate" or "done" action before other actions, because the page changes afterward.
 - Return ONLY the JSON: either a single object or an array of objects. No explanation, no markdown, no code fences.`;
         return AGENT_PROMPT_APEX_BROWSER + additions;
     }
@@ -1694,7 +1695,7 @@
                         agent: 'apex-browser',
                         reasoningEffort: 'low',
                         model: { providerID: providerID, modelID: modelID },
-                        parts: [{ type: 'text', text: 'You are the apex-browser planner. Respond with ONLY a single JSON plan object (no markdown, no code fences, no prose) using this schema: {thought, action, elementId, text, url, target, key, direction, durationMs, answer}. You MAY return a JSON ARRAY of 2-4 action objects when they form one logical operation on the same page (e.g. click the field then type, or click + type + press Enter) — they run in order. Do NOT put a "navigate" or "done" action before other actions.\n\nUSER REQUEST:\n' + JSON.stringify(userMessage) }]
+                        parts: [{ type: 'text', text: 'You are the apex-browser planner. Respond with a single JSON plan object OR a JSON ARRAY of 2-4 action objects (no markdown, no code fences, no prose) using this schema: {thought, action, elementId, text, url, target, key, direction, durationMs, answer}. BATCHING RULE: when the goal requires multiple local UI steps on the same page, you MUST return them as ONE JSON ARRAY of action objects executed in order — e.g. [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."}] or [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."},{"action":"key","key":"Enter"}]. Combine "press a field" + "type text" into a single array instead of separate replies. Do NOT put a "navigate" or "done" action before other actions.\n\nUSER REQUEST:\n' + JSON.stringify(userMessage) }]
                     };
                 }
 
