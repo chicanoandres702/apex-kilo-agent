@@ -1,0 +1,15 @@
+# Dependencies (better-sqlite3 native build)
+node_modules/
+package-lock.json
+
+# Runtime data — SQLite DB + JSONL log mirrors (regenerated at runtime)
+/opt/apex-log-server/data/
+/opt/apex-log-server/logs/
+
+# Local env / secrets
+.env
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db

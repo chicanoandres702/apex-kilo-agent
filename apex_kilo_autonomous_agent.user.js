@@ -105,7 +105,34 @@
         // actual field value back and confirms the text really landed. If it didn't,
         // it retries with alternate injection strategies and tells the planner to
         // "retry a different way" instead of lying that the field was filled.
-        VERIFY_FIELDS: true
+        VERIFY_FIELDS: true,
+        // ===== Live Log Server (centralized multi-app logging) =====
+        // When LOG_SERVER.ENABLED, every log line is shipped to a central Universal
+        // Log Server (SQLite + JSONL). Read them live at logs.devproject.vip or via
+        // `tail -f log-server/logs/<ns>/<date>.jsonl`. Verbose/debug lines are
+        // shipped too (the server stores all levels; only the on-page console hides
+        // verbose unless you toggle it).
+        LOG_SERVER: {
+            ENABLED: true,
+            URL: 'https://logs.devproject.vip/api/ingest',
+            NS: 'apex-agent',
+            APP: 'apex-kilo-agent',
+            TOKEN: '',
+            TAGS: 'userscript,browser',
+            REPO: 'https://github.com/chicanoandres702/apex-kilo-agent',
+            BRANCH: 'master',
+            COMMIT: '58e0005',
+            FLUSH_MS: 2500
+        }
+    };
+
+    // Build/identity metadata attached to every shipped log (AI-referenceable:
+    // links a log line back to the exact code revision that produced it).
+    const META = {
+        repo: 'https://github.com/chicanoandres702/apex-kilo-agent',
+        branch: 'master',
+        commit: '58e0005',
+        version: '8.14'
     };
 
     // Safe GM / LocalStorage abstraction
@@ -171,6 +198,8 @@
         showConsole: true,
         verbose: false,
         logCount: 0,
+        runId: null,
+        sessionId: null,
         goal: '',
         stepCount: 0,
         history: [],
@@ -335,6 +364,7 @@
                 id: 'log_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
                 time: timestamp,
                 level: level,
+                type: level,
                 message: message,
                 details: details ? (typeof details === 'object' ? safeStringify(details, 2000) : String(details)) : null,
                 raw: details,
@@ -346,6 +376,7 @@
                 if (STATE.debugLogs.length > LOG_CAP) STATE.debugLogs.shift();
                 STATE.logCount = (STATE.logCount || 0) + 1;
             }
+            try { queueLogShip(entry); } catch (_) {}
             try { renderConsole(); } catch (e3) {}
             try {
                 if (level === 'ERR' || level === 'ERROR') {
@@ -358,6 +389,103 @@
             try { console.error('addLog internal failure:', e); } catch (_) {}
         }
     }
+
+    // =========================================================================
+    // 1c. LIVE LOG SERVER SHIPPING (centralized multi-app logging)
+    // =========================================================================
+    // Every log line (including verbose/debug) is buffered and flushed in batches
+    // to the Universal Log Server. Shipping is fire-and-forget: it NEVER calls
+    // addLog (so it can't recurse) and silently no-ops on any failure. This keeps
+    // the on-page console lightweight while archiving a complete, server-side,
+    // grep-able history of the agent's reasoning/actions/errors.
+    let LOG_SHIP_QUEUE = [];
+    let LOG_SHIP_TIMER = null;
+
+    function queueLogShip(entry) {
+        try {
+            const cfg = getConfig().LOG_SERVER || {};
+            if (!cfg.ENABLED) return;
+            // Structured runtime context (correlation + repro info) attached to every line.
+            let ctx = null;
+            try {
+                const w = (typeof window !== 'undefined') ? window : null;
+                ctx = {
+                    env: cfg.REPO ? 'prod' : 'dev',
+                    run_id: STATE.runId || undefined,
+                    session: STATE.sessionId || undefined,
+                    step: STATE.stepCount || 0,
+                    goal: (STATE.goal || '').slice(0, 200) || undefined,
+                    mood: STATE.agentMood || undefined,
+                    model: (getConfig().KILO_MODEL || getConfig().MODEL || '').slice(0, 64) || undefined,
+                    provider: getConfig().PROVIDER || undefined,
+                    url: w && w.location ? w.location.href : undefined,
+                    ua: (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent.slice(0, 160) : undefined,
+                    viewport: (w && w.innerWidth && w.innerHeight) ? (w.innerWidth + 'x' + w.innerHeight) : undefined
+                };
+                // Drop empty fields to keep the payload small.
+                for (const k in ctx) if (ctx[k] === undefined || ctx[k] === '') delete ctx[k];
+                if (!Object.keys(ctx).length) ctx = null;
+            } catch (_) { ctx = null; }
+
+            // Slim projection: ship the essentials, keep details bounded.
+            const ship = {
+                ns: cfg.NS || 'apex-agent',
+                app: cfg.APP || 'apex-kilo-agent',
+                t: entry.time,
+                l: entry.level,
+                type: entry.type || undefined,
+                m: entry.message,
+                d: entry.details && entry.details.length > 16000 ? entry.details.slice(0, 16000) : entry.details,
+                s: entry.stack,
+                v: !!entry.verbose,
+                tags: cfg.TAGS || undefined,
+                host: (typeof window !== 'undefined' && (window.location ? window.location.hostname : undefined)) || undefined,
+                repo: cfg.REPO || META.repo || undefined,
+                branch: cfg.BRANCH || META.branch || undefined,
+                commit: cfg.COMMIT || META.commit || undefined,
+                ctx: ctx,
+                src: 'apex_kilo_autonomous_agent.user.js'
+            };
+            LOG_SHIP_QUEUE.push(ship);
+            if (LOG_SHIP_QUEUE.length >= 200) flushLogShip();
+            else if (!LOG_SHIP_TIMER) {
+                const iv = Math.max(500, parseInt((cfg.FLUSH_MS || 2500), 10));
+                LOG_SHIP_TIMER = setTimeout(flushLogShip, iv);
+            }
+        } catch (_) {}
+    }
+
+    function flushLogShip() {
+        if (LOG_SHIP_TIMER) { clearTimeout(LOG_SHIP_TIMER); LOG_SHIP_TIMER = null; }
+        if (!LOG_SHIP_QUEUE.length) return;
+        const batch = LOG_SHIP_QUEUE; LOG_SHIP_QUEUE = [];
+        let cfg;
+        try { cfg = getConfig().LOG_SERVER || {}; } catch (_) { cfg = {}; }
+        if (!cfg.ENABLED || !cfg.URL) return;
+        const payload = JSON.stringify(batch);
+        const headers = { 'Content-Type': 'application/json' };
+        if (cfg.TOKEN) headers['X-Log-Token'] = cfg.TOKEN;
+        const req = {
+            method: 'POST',
+            url: cfg.URL,
+            headers: headers,
+            data: payload,
+            // Do not block on or log the result — shipping must be invisible to the agent.
+            onload: function () {},
+            onerror: function () {}
+        };
+        try {
+            if (typeof GM_xmlhttpRequest !== 'undefined') GM_xmlhttpRequest(req);
+            else if (typeof fetch !== 'undefined') {
+                fetch(cfg.URL, { method: 'POST', headers: headers, body: payload }).catch(function () {});
+            }
+        } catch (_) {}
+    }
+
+    // Hook into the existing logger: every entry is queued for shipping.
+    const _origAddLog = addLog;
+    // (re-bind by wrapping the push path is unnecessary; we call queueLogShip inside addLog below)
+    // To avoid double-wrapping, queueLogShip is invoked directly within addLog.
 
     // =========================================================================
     // 2. UNIVERSAL DOM & SHADOW DOM SCANNER
@@ -2052,11 +2180,34 @@
         STATE.stepCount = 0;
         STATE.history = [];
         STATE.runStartedAt = Date.now();
+        STATE.runId = 'run_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
         kiloSessionId = null;
         kiloSessionPromise = null;
         STATE.agentMood = 'scanning';
         STATE.statusText = 'Starting autonomous agent loop...';
         addLog('INFO', `Started agent with goal: "${STATE.goal}"`);
+        // Archive the full effective app configuration for this run so logs are
+        // self-describing (which model/server/toggles produced these actions).
+        try {
+            const c = getConfig();
+            const settingsSnapshot = {
+                goal: STATE.goal,
+                provider: c.PROVIDER,
+                model: c.KILO_MODEL || c.MODEL,
+                server: c.SERVER,
+                ai_base: c.KILO_AI_BASE,
+                max_steps: c.MAX_STEPS,
+                step_delay_ms: c.STEP_DELAY_MS,
+                verify_fields: !!c.VERIFY_FIELDS,
+                allow_heuristic: !!c.ALLOW_HEURISTIC_FALLBACK,
+                enable_badges: !!c.ENABLE_BADGES,
+                llm_retries: c.LLM_RETRIES,
+                reasoning_effort: c.REASONING_EFFORT,
+                element_text_limit: c.ELEMENT_TEXT_LIMIT,
+                log_server: { enabled: !!(c.LOG_SERVER && c.LOG_SERVER.ENABLED), ns: c.LOG_SERVER && c.LOG_SERVER.NS, app: c.LOG_SERVER && c.LOG_SERVER.APP }
+            };
+            addLog('CONFIG', 'Agent run configuration', settingsSnapshot);
+        } catch (_) {}
         updateHUD();
         persistState();
         setTimeout(runAgentStep, 100);
@@ -2630,6 +2781,7 @@
                                     <button class="tab-btn active" data-tab="server">🖧 Server</button>
                                     <button class="tab-btn" data-tab="models">🧠 Models</button>
                                     <button class="tab-btn" data-tab="behavior">⚙️ Behavior</button>
+                                    <button class="tab-btn" data-tab="logserver">📡 Logs</button>
                                 </div>
                                 <div id="tab-server" class="tab-panel">
                                     <div class="field-row"><label class="field-label">Server:</label><select id="cfg-server" class="field-select"><option value="devproject">DevProject — 4096 (/ai) · DEFAULT</option><option value="local">Local OpenCode — 127.0.0.1:4096</option><option value="kilo4097">Kilo Server — 4097 (/v1)</option><option value="custom">Custom Server…</option></select></div>
@@ -2639,7 +2791,18 @@
                                     <div id="kilo-auth-row" class="field-row"><label class="field-label">Kilo Shared Secret (X-Kilo-Auth):</label><input id="cfg-kiloauth" type="password" class="field-input" placeholder="shared secret for /ai" /></div>
                                     <div id="kilo-dir-row" class="field-row"><label class="field-label">Working Directory:</label><input id="cfg-kilodir" type="text" class="field-input" placeholder="/" /></div>
                                     <div class="field-label" style="color:#7dd3fc; font-size:10px; line-height:1.3;">Default planner runs on 4096 (/ai) as the apex-browser agent — a tool-locked, in-page planner. It returns a plan JSON this script executes locally.</div>
-                                </div>
+                                 </div>
+                                 <div id="tab-logserver" class="tab-panel" style="display:none;">
+                                     <div class="field-row" style="flex-direction:row; align-items:center; justify-content:space-between; gap:8px;"><label class="field-label" style="display:flex; align-items:center; gap:4px; cursor:pointer; color:#34d399;"><input id="cfg-logserver-enabled" type="checkbox" /> Ship logs to Live Log Server</label></div>
+                                     <div class="field-row"><label class="field-label">Log Server URL:</label><input id="cfg-logserver-url" type="text" class="field-input" placeholder="https://logs.devproject.vip/api/ingest" /></div>
+                                     <div class="field-row"><label class="field-label">Namespace:</label><input id="cfg-logserver-ns" type="text" class="field-input" placeholder="apex-agent" /></div>
+                                     <div class="field-row"><label class="field-label">App name:</label><input id="cfg-logserver-app" type="text" class="field-input" placeholder="apex-kilo-agent" /></div>
+                                     <div class="field-row"><label class="field-label">Tags (csv):</label><input id="cfg-logserver-tags" type="text" class="field-input" placeholder="userscript,browser" /></div>
+                                     <div class="field-row"><label class="field-label">Write Token:</label><input id="cfg-logserver-token" type="password" class="field-input" placeholder="(optional)" /></div>
+                                     <div class="field-row"><label class="field-label">Flush ms:</label><input id="cfg-logserver-flush" type="number" class="field-input" style="width:90px;" min="500" max="30000" /></div>
+                                     <div class="field-row" style="margin-top:4px;"><a id="btn-view-live-logs" class="text-link-btn" target="_blank" rel="noopener">🔎 Open Live Log Viewer</a></div>
+                                     <div class="field-label" style="color:#94a3b8; font-size:10px; line-height:1.3;">All levels (incl. verbose/debug/errors) are archived to the server. View them at logs.devproject.vip or via <code>tail -f log-server/logs/&lt;ns&gt;/&lt;date&gt;.jsonl</code>.</div>
+                                 </div>
                                 <div id="tab-models" class="tab-panel" style="display:none;">
                                     <div class="field-row"><label class="field-label">Provider (4096 /ai):</label><select id="cfg-provpicker" class="field-select"></select></div>
                                     <div class="field-row"><label class="field-label">Session Model:</label><select id="cfg-kilomodel" class="field-select model-select"></select><input id="cfg-kilomodel-custom" type="text" class="field-input" placeholder="provider/model" style="display:none; margin-top:4px;" /></div>
@@ -2780,14 +2943,15 @@
         const pauseLabel = shadowRoot.getElementById('pause-agent-label');
         const stopBtn = shadowRoot.getElementById('stop-agent-btn');
 
-        // Settings tabs (Server / Models / Behavior) so the modal never overflows.
+        // Settings tabs (Server / Models / Behavior / Logs) so the modal never overflows.
         const tabServer = shadowRoot.getElementById('tab-server');
         const tabModels = shadowRoot.getElementById('tab-models');
         const tabBehavior = shadowRoot.getElementById('tab-behavior');
+        const tabLogServer = shadowRoot.getElementById('tab-logserver');
         const tabBtns = Array.from(shadowRoot.querySelectorAll('.tab-btn'));
         function showSettingsTab(name) {
             STATE.settingsTab = name;
-            const map = { server: tabServer, models: tabModels, behavior: tabBehavior };
+            const map = { server: tabServer, models: tabModels, behavior: tabBehavior, logserver: tabLogServer };
             Object.keys(map).forEach(k => { if (map[k]) map[k].style.display = (k === name) ? 'flex' : 'none'; });
             tabBtns.forEach(b => b.classList.toggle('active', b.dataset.tab === name));
             if (settingsFragment) settingsFragment.scrollTop = 0;
@@ -3097,6 +3261,32 @@
         const llmRetriesInp = shadowRoot.getElementById('cfg-llm-retries');
         const verifyToggle = shadowRoot.getElementById('cfg-verify-toggle');
 
+        // ---- Live Log Server settings ----
+        const lsEnabled = shadowRoot.getElementById('cfg-logserver-enabled');
+        const lsUrl = shadowRoot.getElementById('cfg-logserver-url');
+        const lsNs = shadowRoot.getElementById('cfg-logserver-ns');
+        const lsApp = shadowRoot.getElementById('cfg-logserver-app');
+        const lsTags = shadowRoot.getElementById('cfg-logserver-tags');
+        const lsToken = shadowRoot.getElementById('cfg-logserver-token');
+        const lsFlush = shadowRoot.getElementById('cfg-logserver-flush');
+        const lsViewBtn = shadowRoot.getElementById('btn-view-live-logs');
+        const lsCfg = currentCfg.LOG_SERVER || {};
+        if (lsEnabled) lsEnabled.checked = lsCfg.ENABLED !== false;
+        if (lsUrl) lsUrl.value = lsCfg.URL || 'https://logs.devproject.vip/api/ingest';
+        if (lsNs) lsNs.value = lsCfg.NS || 'apex-agent';
+        if (lsApp) lsApp.value = lsCfg.APP || 'apex-kilo-agent';
+        if (lsTags) lsTags.value = lsCfg.TAGS || 'userscript,browser';
+        if (lsToken) lsToken.value = lsCfg.TOKEN || '';
+        if (lsFlush) lsFlush.value = lsCfg.FLUSH_MS || 2500;
+        if (lsViewBtn) {
+            const viewerUrl = () => {
+                const ns = (lsNs && lsNs.value.trim()) || (lsCfg.NS || 'apex-agent');
+                return 'https://logs.devproject.vip/?ns=' + encodeURIComponent(ns);
+            };
+            lsViewBtn.href = viewerUrl();
+            lsViewBtn.onclick = () => { try { lsViewBtn.href = viewerUrl(); } catch (_) {} };
+        }
+
         providerSel.value = currentCfg.PROVIDER || 'devproject';
         apikeyInp.value = currentCfg.API_KEY || '';
         kiloAuthInp.value = currentCfg.KILO_AUTH || '';
@@ -3142,7 +3332,19 @@
                 VERIFY_FIELDS: verifyToggle.checked,
                 AUTO_EXECUTE: !!(autoExecToggle && autoExecToggle.checked),
                 MAX_STEPS: maxSteps,
-                LLM_RETRIES: retries
+                LLM_RETRIES: retries,
+                LOG_SERVER: {
+                    ENABLED: !!(lsEnabled && lsEnabled.checked),
+                    URL: (lsUrl && lsUrl.value.trim()) || 'https://logs.devproject.vip/api/ingest',
+                    NS: (lsNs && lsNs.value.trim()) || 'apex-agent',
+                    APP: (lsApp && lsApp.value.trim()) || 'apex-kilo-agent',
+                    TOKEN: (lsToken && lsToken.value.trim()) || '',
+                    TAGS: (lsTags && lsTags.value.trim()) || 'userscript,browser',
+                    REPO: lsCfg.REPO || 'https://github.com/chicanoandres702/apex-kilo-agent',
+                    BRANCH: lsCfg.BRANCH || 'master',
+                    COMMIT: lsCfg.COMMIT || '58e0005',
+                    FLUSH_MS: Math.max(500, parseInt(lsFlush && lsFlush.value, 10) || 2500)
+                }
             });
             if (domGlowToggle && badgesToggle) domGlowToggle.checked = badgesToggle.checked;
             if (modelNameLabel && typeof readModelValue === 'function') {
@@ -3154,7 +3356,8 @@
         // Auto-save whenever any field changes so models and settings always persist.
         [serverSel, aiBaseInp, baseUrlInp, providerSel, apikeyInp, kiloAuthInp, kiloDirInp,
          kiloModelSel, kiloModelCustom, badgesToggle,
-         heuristicToggle, verifyToggle, llmRetriesInp, maxStepsInput, domGlowToggle, autoExecToggle
+         heuristicToggle, verifyToggle, llmRetriesInp, maxStepsInput, domGlowToggle, autoExecToggle,
+         lsEnabled, lsUrl, lsNs, lsApp, lsTags, lsToken, lsFlush
         ].forEach(el => {
             if (!el) return;
             el.addEventListener('change', saveConfigFromUI);
@@ -3357,6 +3560,7 @@
     // =========================================================================
     function init() {
         ensureHUD();
+        if (!STATE.sessionId) STATE.sessionId = 'sess_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', () => {
                 ensureHUD();
@@ -3371,6 +3575,15 @@
 
         // Periodically monitor DOM to ensure SPA route transitions never detach the HUD floating FAB/pill
         setInterval(ensureHUD, 1000);
+
+        // Flush queued logs to the server on page hide / unload so nothing is lost.
+        if (typeof window !== 'undefined') {
+            window.addEventListener('beforeunload', () => { try { flushLogShip(); } catch (_) {} });
+            window.addEventListener('pagehide', () => { try { flushLogShip(); } catch (_) {} });
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'hidden') { try { flushLogShip(); } catch (_) {} }
+            });
+        }
     }
 
     // Resume a run that was in-progress when the previous page navigated away.
