@@ -1,9 +1,7 @@
 // ==UserScript==
 // @name         Autonomous Web Browser Agent (Kilo Server Edition)
 // @namespace    http://tampermonkey.net/
-// @version      8.14
-// @updateURL    https://devproject.vip/apex-agent/apex_kilo_autonomous_agent.user.js
-// @downloadURL  https://devproject.vip/apex-agent/apex_kilo_autonomous_agent.user.js
+// @version      8.4
 // @description  Full autonomous browser agent userscript for Tampermonkey. Deep Shadow DOM scanner, visual numbered badges, and LLM reasoning via the Kilo Code CLI server gateway (devproject.vip/ai), ported from Kilocode-Android2.
 // @author       Autonomous Agent Project
 // @match        *://*/*
@@ -75,24 +73,7 @@
         LLM_RETRIES: 3,
         // Per-plan LLM request timeout (ms). Kept tight so a slow/queued model fails
         // fast and the run surfaces a clear error instead of appearing "stuck".
-        // NOTE: the devproject 'kilo-auto/free' model commonly replies in 8-19s, so a
-        // value below that just triggers wasted retries. Set above the model's typical
-        // latency if you'd rather wait for a real answer than retry.
-        PLAN_TIMEOUT_MS: 10000,
-        // Planner reasoning effort. Lower = fewer reasoning tokens = faster replies.
-        // 'low' is the default; 'none' (where the server supports it) skips reasoning
-        // entirely and is the fastest. Some servers reject 'none' with a 400 — if so,
-        // the run will surface that error and you should set this back to 'low'.
-        REASONING_EFFORT: 'low',
-        // Max characters of each element's text/name sent to the planner. Smaller =
-        // fewer input tokens = faster prefill. The executor re-scans the live DOM, so
-        // the planner only needs enough text to pick the right node.
-        ELEMENT_TEXT_LIMIT: 120,
-        // Create a FRESH short-lived session for EVERY step (default true). This keeps
-        // each request's input small but costs an extra ~0.5-2.6s POST /session per
-        // step. Set false to reuse ONE session across the whole run: saves that
-        // round-trip on every step, at the cost of growing context on very long runs.
-        SESSION_PER_STEP: true,
+        PLAN_TIMEOUT_MS: 30000,
         // Hard wall-clock deadline (ms) for the ENTIRE run. No matter what, the agent
         // stops after this so it can never hang the tab forever. 0 = disabled.
         RUN_DEADLINE_MS: 180000,
@@ -105,35 +86,7 @@
         // actual field value back and confirms the text really landed. If it didn't,
         // it retries with alternate injection strategies and tells the planner to
         // "retry a different way" instead of lying that the field was filled.
-        VERIFY_FIELDS: true,
-        // ===== Live Log Server (centralized multi-app logging) =====
-        // When LOG_SERVER.ENABLED, every log line is shipped to the central Universal
-        // Log Server (SQLite + JSONL) at logs.devproject.vip. Read them live at
-        // https://logs.devproject.vip (namespace "apex-agent") or via
-        // `tail -f /opt/apex-log-server/logs/apex-agent/<date>.jsonl`. Verbose/debug
-        // lines are shipped too (the server stores all levels; only the on-page
-        // console hides verbose unless you toggle it).
-        LOG_SERVER: {
-            ENABLED: true,
-            URL: 'https://logs.devproject.vip/api/ingest',
-            NS: 'apex-agent',
-            APP: 'apex-kilo-agent',
-            TOKEN: '',
-            TAGS: 'userscript,browser',
-            REPO: 'https://github.com/chicanoandres702/apex-kilo-agent',
-            BRANCH: 'master',
-            COMMIT: '58e0005',
-            FLUSH_MS: 2500
-        }
-    };
-
-    // Build/identity metadata attached to every shipped log (AI-referenceable:
-    // links a log line back to the exact code revision that produced it).
-    const META = {
-        repo: 'https://github.com/chicanoandres702/apex-kilo-agent',
-        branch: 'master',
-        commit: '58e0005',
-        version: '8.14'
+        VERIFY_FIELDS: true
     };
 
     // Safe GM / LocalStorage abstraction
@@ -199,8 +152,6 @@
         showConsole: true,
         verbose: false,
         logCount: 0,
-        runId: null,
-        sessionId: null,
         goal: '',
         stepCount: 0,
         history: [],
@@ -365,7 +316,6 @@
                 id: 'log_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
                 time: timestamp,
                 level: level,
-                type: level,
                 message: message,
                 details: details ? (typeof details === 'object' ? safeStringify(details, 2000) : String(details)) : null,
                 raw: details,
@@ -377,7 +327,6 @@
                 if (STATE.debugLogs.length > LOG_CAP) STATE.debugLogs.shift();
                 STATE.logCount = (STATE.logCount || 0) + 1;
             }
-            try { queueLogShip(entry); } catch (_) {}
             try { renderConsole(); } catch (e3) {}
             try {
                 if (level === 'ERR' || level === 'ERROR') {
@@ -390,103 +339,6 @@
             try { console.error('addLog internal failure:', e); } catch (_) {}
         }
     }
-
-    // =========================================================================
-    // 1c. LIVE LOG SERVER SHIPPING (centralized multi-app logging)
-    // =========================================================================
-    // Every log line (including verbose/debug) is buffered and flushed in batches
-    // to the Universal Log Server. Shipping is fire-and-forget: it NEVER calls
-    // addLog (so it can't recurse) and silently no-ops on any failure. This keeps
-    // the on-page console lightweight while archiving a complete, server-side,
-    // grep-able history of the agent's reasoning/actions/errors.
-    let LOG_SHIP_QUEUE = [];
-    let LOG_SHIP_TIMER = null;
-
-    function queueLogShip(entry) {
-        try {
-            const cfg = getConfig().LOG_SERVER || {};
-            if (!cfg.ENABLED) return;
-            // Structured runtime context (correlation + repro info) attached to every line.
-            let ctx = null;
-            try {
-                const w = (typeof window !== 'undefined') ? window : null;
-                ctx = {
-                    env: cfg.REPO ? 'prod' : 'dev',
-                    run_id: STATE.runId || undefined,
-                    session: STATE.sessionId || undefined,
-                    step: STATE.stepCount || 0,
-                    goal: (STATE.goal || '').slice(0, 200) || undefined,
-                    mood: STATE.agentMood || undefined,
-                    model: (getConfig().KILO_MODEL || getConfig().MODEL || '').slice(0, 64) || undefined,
-                    provider: getConfig().PROVIDER || undefined,
-                    url: w && w.location ? w.location.href : undefined,
-                    ua: (typeof navigator !== 'undefined' && navigator.userAgent) ? navigator.userAgent.slice(0, 160) : undefined,
-                    viewport: (w && w.innerWidth && w.innerHeight) ? (w.innerWidth + 'x' + w.innerHeight) : undefined
-                };
-                // Drop empty fields to keep the payload small.
-                for (const k in ctx) if (ctx[k] === undefined || ctx[k] === '') delete ctx[k];
-                if (!Object.keys(ctx).length) ctx = null;
-            } catch (_) { ctx = null; }
-
-            // Slim projection: ship the essentials, keep details bounded.
-            const ship = {
-                ns: cfg.NS || 'apex-agent',
-                app: cfg.APP || 'apex-kilo-agent',
-                t: entry.time,
-                l: entry.level,
-                type: entry.type || undefined,
-                m: entry.message,
-                d: entry.details && entry.details.length > 16000 ? entry.details.slice(0, 16000) : entry.details,
-                s: entry.stack,
-                v: !!entry.verbose,
-                tags: cfg.TAGS || undefined,
-                host: (typeof window !== 'undefined' && (window.location ? window.location.hostname : undefined)) || undefined,
-                repo: cfg.REPO || META.repo || undefined,
-                branch: cfg.BRANCH || META.branch || undefined,
-                commit: cfg.COMMIT || META.commit || undefined,
-                ctx: ctx,
-                src: 'apex_kilo_autonomous_agent.user.js'
-            };
-            LOG_SHIP_QUEUE.push(ship);
-            if (LOG_SHIP_QUEUE.length >= 200) flushLogShip();
-            else if (!LOG_SHIP_TIMER) {
-                const iv = Math.max(500, parseInt((cfg.FLUSH_MS || 2500), 10));
-                LOG_SHIP_TIMER = setTimeout(flushLogShip, iv);
-            }
-        } catch (_) {}
-    }
-
-    function flushLogShip() {
-        if (LOG_SHIP_TIMER) { clearTimeout(LOG_SHIP_TIMER); LOG_SHIP_TIMER = null; }
-        if (!LOG_SHIP_QUEUE.length) return;
-        const batch = LOG_SHIP_QUEUE; LOG_SHIP_QUEUE = [];
-        let cfg;
-        try { cfg = getConfig().LOG_SERVER || {}; } catch (_) { cfg = {}; }
-        if (!cfg.ENABLED || !cfg.URL) return;
-        const payload = JSON.stringify(batch);
-        const headers = { 'Content-Type': 'application/json' };
-        if (cfg.TOKEN) headers['X-Log-Token'] = cfg.TOKEN;
-        const req = {
-            method: 'POST',
-            url: cfg.URL,
-            headers: headers,
-            data: payload,
-            // Do not block on or log the result — shipping must be invisible to the agent.
-            onload: function () {},
-            onerror: function () {}
-        };
-        try {
-            if (typeof GM_xmlhttpRequest !== 'undefined') GM_xmlhttpRequest(req);
-            else if (typeof fetch !== 'undefined') {
-                fetch(cfg.URL, { method: 'POST', headers: headers, body: payload }).catch(function () {});
-            }
-        } catch (_) {}
-    }
-
-    // Hook into the existing logger: every entry is queued for shipping.
-    const _origAddLog = addLog;
-    // (re-bind by wrapping the push path is unnecessary; we call queueLogShip inside addLog below)
-    // To avoid double-wrapping, queueLogShip is invoked directly within addLog.
 
     // =========================================================================
     // 2. UNIVERSAL DOM & SHADOW DOM SCANNER
@@ -1034,35 +886,6 @@
             return { success: true };
         }
 
-        // Press a keyboard key on the focused element (e.g. Enter, Escape, Tab, ArrowDown).
-        // Synthetic key events do NOT trigger native default actions, so for Enter inside a
-        // form we also call form.requestSubmit() so search boxes / forms actually submit.
-        if (action === 'key' || action === 'press_key' || action === 'keyboard' || action === 'keypress') {
-            targetEl.focus();
-            const keyName = actionItem.key || actionItem.keyName || text || 'Enter';
-            const keyMap = { Enter: 13, Return: 13, Escape: 27, Esc: 27, Tab: 9, Backspace: 8, Delete: 46, ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, Space: 32, ' ': 32, Home: 36, End: 35, PageUp: 33, PageDown: 34 };
-            const keyCode = keyMap[keyName] != null ? keyMap[keyName] : (typeof keyName === 'string' && keyName.length === 1 ? keyName.toUpperCase().charCodeAt(0) : 0);
-            const kopts = { key: keyName, code: keyName, keyCode, which: keyCode, bubbles: true, cancelable: true };
-            try {
-                targetEl.dispatchEvent(new KeyboardEvent('keydown', kopts));
-                targetEl.dispatchEvent(new KeyboardEvent('keypress', kopts));
-                targetEl.dispatchEvent(new KeyboardEvent('keyup', kopts));
-            } catch (e) {
-                try { targetEl.dispatchEvent(new KeyboardEvent('keydown', { key: keyName, bubbles: true, cancelable: true })); } catch (e2) {}
-            }
-            if ((keyName === 'Enter' || keyName === 'Return') && targetEl.form) {
-                try {
-                    if (typeof targetEl.form.requestSubmit === 'function') targetEl.form.requestSubmit();
-                    else targetEl.form.submit();
-                    persistState();
-                    await new Promise(r => setTimeout(r, 800));
-                    return { success: true, pressed: keyName, submitted: true };
-                } catch (e) {}
-            }
-            await new Promise(r => setTimeout(r, config.STEP_DELAY_MS));
-            return { success: true, pressed: keyName };
-        }
-
         throw new Error(`Unrecognized action type: ${action}`);
     }
 
@@ -1420,7 +1243,6 @@
         if (action == null) return null;
         const a = String(action).trim().toLowerCase();
         if (!a) return null;
-        if (a === 'tui_sync') return 'wait';
         if (VALID_ACTIONS.includes(a)) return a;
         if (ACTION_SYNONYMS[a]) return ACTION_SYNONYMS[a];
         // Last-ditch: if the value contains a known valid action word, use it.
@@ -1461,53 +1283,6 @@
         return out;
     }
 
-    // Parse <tool_call> XML emitted by TOOL-CALLING models (e.g. poolside/laguna),
-    // which do NOT return JSON. Format observed in the wild:
-    //   <tool_call>scroll<arg_key>direction</arg_key><arg_value>down</arg_value><arg_key>elementId</arg_key><arg_value>6</arg_value></tool_call>
-    //   <tool_call>type<arg_key>elementId</arg_key><arg_value>5</arg_value><arg_key>text</arg_key><arg_value>hello</arg_value></tool_call>
-    // The action name is the leading text; each arg_key/arg_value pair becomes a
-    // field on the action object. Multiple <tool_call> blocks = an action sequence.
-    function extractToolCalls(text) {
-        const callRe = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
-        const out = [];
-        let m;
-        while ((m = callRe.exec(text)) !== null) {
-            const inner = m[1];
-            const firstKey = inner.indexOf('<arg_key>');
-            const namePart = (firstKey === -1 ? inner : inner.slice(0, firstKey)).trim();
-            // Action name may be "scroll", "click_element", "type_text", etc.
-            const action = namePart.replace(/[^\w]/g, '_').split('_')[0] || namePart;
-            const argRe = /<arg_key>([\s\S]*?)<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/gi;
-            const args = {};
-            let a;
-            while ((a = argRe.exec(inner)) !== null) {
-                const k = a[1].trim();
-                let v = a[2].trim();
-                if (/^-?\d+(\.\d+)?$/.test(v)) v = Number(v);
-                args[k] = v;
-            }
-            const obj = {};
-            // Map common arg names onto our executor schema.
-            for (const k of ['text', 'url', 'target', 'key', 'direction', 'durationMs']) {
-                if (args[k] !== undefined) obj[k] = args[k];
-            }
-            const elemRaw = args.elementId != null ? args.elementId : args.element_id;
-            if (elemRaw !== undefined && elemRaw !== null && elemRaw !== '') obj.elementId = Number(elemRaw);
-            if (args.toElementId !== undefined) obj.toElementId = Number(args.toElementId);
-            // A tool that supplies a "key" arg is a keyboard press -> 'key' action
-            // (e.g. press_key/key_press with key="Enter"). Otherwise normalize the
-            // tool name to one of our valid actions.
-            if (args.key !== undefined) {
-                obj.action = 'key';
-            } else {
-                const norm = normalizePlanAction(action);
-                obj.action = norm || action;
-            }
-            out.push(obj);
-        }
-        return out;
-    }
-
     // Pull the action value regardless of common key casings the model may emit.
     function getRawAction(obj) {
         if (!obj || typeof obj !== 'object') return undefined;
@@ -1527,23 +1302,19 @@
         // 1) Whole-string parse (with trailing-comma tolerance).
         let plan = tryParse(text);
         if (plan && typeof plan === 'object') {
-            // A JSON array of actions = an action SEQUENCE (e.g. focus field then type).
-            // Return it as-is so the validator can run each item in order.
-            if (Array.isArray(plan)) return plan;
             const norm = normalizePlanAction(getRawAction(plan));
             if (norm) { plan.action = norm; return plan; }
+            if (Array.isArray(plan) && plan.length) {
+                const first = normalizePlanAction(getRawAction(plan[0]));
+                if (first) { plan[0].action = first; return plan[0]; }
+            }
             // An answer with no explicit action is treated as "done".
             if (plan.answer && String(plan.answer).trim()) { plan.action = 'done'; return plan; }
         }
 
-        // 2) Recover balanced JSON object(s)/array(s) from free-form prose.
-        // A planner may emit an ACTION SEQUENCE (e.g. press a field, then type into
-        // it) as a JSON array, or as several separate JSON objects on their own
-        // lines. We collect EVERY valid action across all candidates and return them
-        // as a sequence, so "press textbox" + "type text" are executed as two
-        // ordered actions instead of being collapsed into a single "best" one.
+        // 2) Recover the best balanced JSON object/array from free-form prose.
         const candidates = extractBalancedObjects(text);
-        const allActions = [];
+        let best = null, bestScore = -1;
         for (const cand of candidates) {
             const obj = tryParse(cand);
             if (!obj || typeof obj !== 'object') continue;
@@ -1554,31 +1325,16 @@
                 if (!norm && item.answer && String(item.answer).trim()) norm = 'done';
                 if (!norm) continue;
                 item.action = norm;
-                // Reconcile executor schema field names.
-                if (!item.text && item.url != null) item.text = item.url;
-                if (item.toElementId == null && item.target != null && typeof item.target === 'number') item.toElementId = item.target;
-                allActions.push(item);
+                // Prefer objects that look like a real plan (action + thought/answer/elementId).
+                let score = 1;
+                if (item.thought) score++;
+                if (item.answer) score++;
+                if (item.elementId !== undefined) score++;
+                if (item.text !== undefined) score++;
+                if (score > bestScore) { bestScore = score; best = item; }
             }
         }
-        if (allActions.length >= 1) return allActions.length === 1 ? allActions[0] : allActions;
-
-        // 3) Recover <tool_call> XML actions (tool-calling models like poolside/laguna
-        // emit these instead of JSON). Each <tool_call> becomes one action; several in
-        // a row form an ordered sequence. This is what lets those faster models work.
-        const toolActions = extractToolCalls(text);
-        if (toolActions.length) {
-            const valid = [];
-            for (const t of toolActions) {
-                const norm = normalizePlanAction(t.action);
-                if (!norm) continue;
-                t.action = norm;
-                if (!t.text && t.url != null) t.text = t.url;
-                if (t.toElementId == null && t.target != null && typeof t.target === 'number') t.toElementId = t.target;
-                valid.push(t);
-            }
-            if (valid.length) return valid.length === 1 ? valid[0] : valid;
-        }
-        return null;
+        return best;
     }
 
     // Boundary used by every planner path: take the RAW LLM output, clean it
@@ -1586,49 +1342,27 @@
     // it into a usable plan BEFORE handing it to the action executor (the
     // "frontend" of this agent). Throws a descriptive error instead of returning
     // garbage, so a bad response fails loudly rather than silently mis-executing.
-    // Validate + field-reconcile a SINGLE plan action object. Returns the normalized
-    // plan, or null if it is not a usable action.
-    function validateSinglePlan(rawObj) {
-        if (!rawObj || typeof rawObj !== 'object') return null;
-        // Reconcile apex-browser agent schema field names with the in-page executor.
-        if (!rawObj.text && rawObj.url != null) rawObj.text = rawObj.url;
-        if (rawObj.toElementId == null && rawObj.target != null && typeof rawObj.target === 'number') rawObj.toElementId = rawObj.target;
-        const norm = normalizePlanAction(getRawAction(rawObj));
-        if (!norm) return null;
-        rawObj.action = norm;
-        if (!VALID_ACTIONS.includes(rawObj.action)) return null;
-        // Element-targeting actions must reference a real element id.
-        const needsElement = ['click', 'touch', 'dblclick', 'rightclick', 'hover', 'type', 'clear', 'select', 'check', 'uncheck', 'drag'];
-        if (needsElement.includes(rawObj.action) && (rawObj.elementId === undefined || rawObj.elementId === null)) return null;
-        // Actions that need a target value must include it.
-        if ((rawObj.action === 'type' || rawObj.action === 'select') && (rawObj.text === undefined || rawObj.text === null)) return null;
-        if (rawObj.action === 'navigate' && (!rawObj.text || !/^https?:\/\//i.test(rawObj.text))) return null;
-        return rawObj;
-    }
-
-    // Boundary used by every planner path: take the RAW LLM output, clean it
-    // (markdown wrappers, trailing commas, stream artifacts, prose) and validate
-    // it into a usable plan BEFORE handing it to the action executor (the
-    // "frontend" of this agent). Returns an ARRAY of validated actions (a single
-    // action is wrapped in a 1-item array) so a planner can emit an action SEQUENCE
-    // (e.g. focus field -> type -> press Enter) in one round-trip. Throws on junk.
     function cleanAndValidatePlan(rawContent) {
         const plan = extractPlanFromText(rawContent);
         if (!plan || typeof plan !== 'object') {
             throw new Error('LLM response was not valid plan JSON after cleaning (markdown/prose stripped).');
         }
-        if (Array.isArray(plan)) {
-            const actions = [];
-            for (const item of plan) {
-                const v = validateSinglePlan(item);
-                if (v) actions.push(v);
-            }
-            if (!actions.length) throw new Error('LLM response parsed as an action array but none of the items were valid.');
-            return actions;
+        if (!VALID_ACTIONS.includes(plan.action)) {
+            throw new Error('LLM response parsed but "action" is missing/invalid: ' + JSON.stringify(plan.action));
         }
-        const single = validateSinglePlan(plan);
-        if (!single) throw new Error('LLM response was not valid plan JSON after cleaning (markdown/prose stripped).');
-        return [single];
+        // Element-targeting actions must reference a real element id.
+        const needsElement = ['click', 'touch', 'dblclick', 'rightclick', 'hover', 'type', 'clear', 'select', 'check', 'uncheck', 'drag'];
+        if (needsElement.includes(plan.action) && (plan.elementId === undefined || plan.elementId === null)) {
+            throw new Error('Plan action "' + plan.action + '" requires an elementId but none was provided.');
+        }
+        // Actions that need a target value must include it.
+        if ((plan.action === 'type' || plan.action === 'select') && (plan.text === undefined || plan.text === null)) {
+            throw new Error('Plan action "' + plan.action + '" requires "text" but none was provided.');
+        }
+        if (plan.action === 'navigate' && (!plan.text || !/^https?:\/\//i.test(plan.text))) {
+            throw new Error('Plan action "navigate" requires a valid http(s) URL in "text".');
+        }
+        return plan;
     }
 
     // Concatenate the text from a Kilo session message's `parts` array. Parts may be
@@ -1730,57 +1464,28 @@
     // in-page and return a plan JSON that THIS browser script executes locally. It
     // must never call MCP/CLI/tools, regardless of provider. Tool use is permanently
     // disabled so the planner stays a pure, in-page apex-browser agent.
-    // Canonical apex-browser agent prompt (from GET /agent on the Kilo server).
-    // Used as the planner system prompt so the model runs the REAL apex-browser
-    // planner (it is trained to emit raw actionable JSON) instead of a custom one.
-    const AGENT_PROMPT_APEX_BROWSER = `You are an autonomous web automation action planner operating inside a browser.
-
-### CRITICAL RULES & CONSTRAINTS:
-1. **NO MCP SERVERS OR CODE EXECUTION**: You have no MCP servers, shell tools, or file system access. Do not attempt tool calls or search for external MCP tools.
-2. **OUTPUT FORMAT**: Respond with a single valid JSON object OR a JSON ARRAY of 2-4 action objects. No Markdown code fences (no \`\`\`json), no conversation, no markdown text before or after.
-3. **ACTION SCHEMA**:
-   Every response must adhere strictly to this schema:
-   {
-     "thought": "1-sentence reasoning about the current DOM state and specific next action",
-      "action": "click" | "touch" | "drag" | "type" | "navigate" | "scroll" | "wait" | "key" | "tui_sync" | "done",
-      "elementId": 0,
-      "target": "Destination for drag/touch: target element id, or {x,y} coordinates",
-      "text": "Exact text to type or prompt to sync",
-     "key": "Enter" | "Tab" | "Escape",
-     "direction": "up" | "down",
-     "durationMs": 1200,
-     "url": "https://...",
-     "answer": "Final result summary when finished"
-   }
-
-4. **ACTION POLICIES**:
-   - **Community / Forum Posting (e.g., Reddit)**:
-     - If community is not selected: click the community picker dropdown, type the subreddit name, and select it.
-     - For video/media posts: click the "Images & Video" tab and click the upload dropzone/button.
-     - If the user instructed not to submit until they upload a file, do NOT click Submit/Post. Emit "action": "done" with your final explanation in "answer".
-    - **Interactive Elements**: Always target the most accurate elementId from the provided interactive elements list.
-    - **Touch & Drag**:
-      - touch: tap a point on a touch interface. Target it the same way as click via elementId (use target for an explicit {x,y} coordinate).
-          - drag: press on elementId (the source), move to target (a destination elementId or {x,y} coordinates), then release. If elementId is absent, target is treated as the destination from the current pointer position.
-       - **ACTION SEQUENCES (BATCHING)**: When one logical operation needs multiple local UI steps on the SAME page, you MUST return them as a JSON ARRAY of action objects executed in order — NOT as separate replies. Examples: click a text field then type into it → [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."}]; or click + type + press Enter; or select a community then click the upload button. Combine "press a field" + "type text" into ONE array. Only the LAST action may be "done", and never put "navigate" before other actions (the page changes).`;
-
     function buildAgentSystemPrompt() {
-        // The apex-browser agent's canonical prompt is the planner. We append a
-        // short "executor compatibility" note so its JSON is consumed correctly by
-        // the in-page action runner (field aliases + the no-tools rule + retries).
-        const additions = `
+        const toolLine = 'CRITICAL TOOL LOCK: You must NOT use any tools, MCP servers, CLI, shell, file system, or any external integration of any kind. You may only reason about the current page and return the plan JSON above. Every action is executed locally inside THIS browser page by the agent script (apex-browser agent). You are never permitted to run commands, spawn processes, or call services outside this page — report your reasoning back through the script only.';
+        return `You are an Autonomous Browser Agent executing user goals by interacting with web elements.
+You are given the user's GOAL, current page URL/Title, and a list of interactive accessibility nodes discovered via Deep Shadow DOM.
 
-### EXECUTOR COMPATIBILITY (how this JSON is consumed):
-- The action is executed LOCALLY in THIS browser page by the agent script. You must NOT use any tools, MCP, shell, or external services — return ONLY the plan JSON.
-- For "navigate", put the URL in "url" (preferred) or "text"; both are accepted.
-- For "drag", put the destination in "target" (preferred) or "toElementId"; both are accepted.
-- For "key", set "key" to the key name (e.g. "Enter"). "tui_sync" is treated as a brief "wait".
-- If the GOAL is a Google search (e.g. "search <query>") and the current page is NOT google.com, use action "navigate" with url "https://www.google.com/search?q=<query>".
-- Do NOT fill unrelated forms (post/contact) when the goal is a search or different topic.
-- The request may include "lastActionVerification": your previous action did NOT land (e.g. field empty after type). Do NOT report done; retry a DIFFERENT way (click the field first, pick a different elementId, or type character-by-character) until the field visibly contains the text.
-- ACTION SEQUENCES (BATCHING): When fulfilling the goal requires multiple local UI steps on the same page, you MUST return them as a SINGLE JSON ARRAY of 2-4 action objects executed in order — e.g. [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."}] or [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."},{"action":"key","key":"Enter"}]. Combine "press a textbox" + "type text" into ONE array instead of separate replies. Do NOT place a "navigate" or "done" action before other actions, because the page changes afterward.
-- Return ONLY the JSON: either a single object or an array of objects. No explanation, no markdown, no code fences.`;
-        return AGENT_PROMPT_APEX_BROWSER + additions;
+IMPORTANT INSTRUCTIONS:
+1. If the GOAL asks to search Google for something (e.g. "Google <query>", "search <query>") and the current page is NOT google.com and lacks a general search bar, you MUST use action "navigate" with url "https://www.google.com/search?q=<query>".
+ 2. Do NOT fill unrelated page forms (like post submit or contact forms) when the goal is a search task or different topic.
+ 3. The request may include a "lastActionVerification" field. If present, it means your previous action did NOT actually land (e.g. the post body was empty after a type). You MUST NOT report the goal as done. Instead, retry a DIFFERENT way: click into the target field first, pick a different element id from the list, or type character-by-character. Keep retrying until the field visibly contains the text.
+ 4. Never claim a type/clear action succeeded unless the field actually shows the text. The script verifies the field and will tell you if it failed.
+${toolLine}
+5. Return ONLY valid JSON matching this schema:
+{
+  "thought": "brief reasoning step",
+  "action": "click" | "touch" | "dblclick" | "rightclick" | "hover" | "type" | "clear" | "select" | "check" | "uncheck" | "drag" | "scroll" | "navigate" | "wait" | "done",
+  "elementId": number (ID from elements list, required for click, touch, dblclick, rightclick, hover, type, clear, select, check, uncheck, drag),
+  "toElementId": number (optional target element ID for drag),
+  "text": "text to type, option value to select, or URL to navigate",
+  "direction": "up" | "down" | "left" | "right" | "top" | "bottom" (for scroll),
+  "durationMs": number (for wait),
+  "answer": "final answer summary if action is done"
+}`;
     }
 
     async function requestKiloPlan(goal, tree, history) {
@@ -1808,13 +1513,7 @@
         // the previous step's session to avoid leaking them.)
         let sessionId;
         try {
-            // Fresh session per step (default): keeps each request's input small, but
-            // costs an extra POST /session round-trip every step. When SESSION_PER_STEP
-            // is false we reuse ONE session for the whole run to skip that round-trip
-            // (faster per step; only a concern on very long runs where context grows).
-            sessionId = config.SESSION_PER_STEP
-                ? await createKiloSession(config)
-                : await ensureKiloSession(config);
+            sessionId = await createKiloSession(config);
         } catch (e) {
             addLog('ERR', `Planner session creation failed: ${e.message}. Is the OpenCode server running at ${config.KILO_AI_BASE}?`);
             throw e;
@@ -1826,7 +1525,6 @@
         const modelStr = (km && km !== 'kilo-auto/free' && km.includes('/')) ? km : '';
 
         const promptSystem = buildAgentSystemPrompt();
-        const txtLimit = (typeof config.ELEMENT_TEXT_LIMIT === 'number' && config.ELEMENT_TEXT_LIMIT > 0) ? config.ELEMENT_TEXT_LIMIT : 120;
 
         const userMessage = {
             goal,
@@ -1835,14 +1533,13 @@
             history: history.slice(-5),
             // Truncate verbose text/name so the input payload (and thus prefill time)
             // stays small — element IDs are preserved so the planner can still target them.
-            // 'pos' is dropped: the executor re-scans the live DOM, so the planner doesn't
-            // need viewport hints, and dropping it cuts tokens on every element.
             elements: tree.map(e => ({
                 id: e.id,
                 tag: e.tag,
                 role: e.role,
-                name: e.name ? String(e.name).slice(0, txtLimit) : e.name,
-                text: e.text ? String(e.text).slice(0, txtLimit) : e.text
+                name: e.name ? String(e.name).slice(0, 160) : e.name,
+                text: e.text ? String(e.text).slice(0, 160) : e.text,
+                pos: e.pos
             }))
         };
 
@@ -1883,19 +1580,19 @@
                     }
                     body = {
                         messageID: makeMsgId(),
-                        reasoningEffort: config.REASONING_EFFORT || 'low',
+                        reasoningEffort: 'low',
                         model: { providerID: pID, modelID: mID },
                         system: promptSystem,
                         parts: [{ type: 'text', text: JSON.stringify(userMessage) }]
                     };
                 } else {
                     // DevProject OpenCode server (port 4096). The 'kilo' provider is
-                    // CONNECTED here; the default planner model is 'kilo-auto/free'
-                    // (free tier, no credits required). IMPORTANT: kilo model IDs
+                    // CONNECTED here with default model 'kilo-auto/balanced'
+                    // (GET /ai/provider -> default.kilo). IMPORTANT: kilo model IDs
                     // themselves contain a slash (e.g. "kilo-auto/balanced"), so we must
                     // NOT naively split them into provider/model — that would send
                     // providerID="kilo-auto", modelID="balanced" and the server 500s.
-                    let providerID = 'kilo', modelID = 'kilo-auto/free';
+                    let providerID = 'kilo', modelID = 'kilo-auto/balanced';
                     if (km && km !== 'kilo-auto/free' && km !== 'kilo-auto/balanced') {
                         // Only override for an explicit other-provider model in
                         // "provider/model" form (e.g. "hpc-ai/deepseek/deepseek-v4-flash").
@@ -1911,9 +1608,9 @@
                     body = {
                         messageID: makeMsgId(),
                         agent: 'apex-browser',
-                        reasoningEffort: config.REASONING_EFFORT || 'low',
+                        reasoningEffort: 'low',
                         model: { providerID: providerID, modelID: modelID },
-                        parts: [{ type: 'text', text: 'You are the apex-browser planner. Respond with a single JSON plan object OR a JSON ARRAY of 2-4 action objects (no markdown, no code fences, no prose) using this schema: {thought, action, elementId, text, url, target, key, direction, durationMs, answer}. BATCHING RULE: when the goal requires multiple local UI steps on the same page, you MUST return them as ONE JSON ARRAY of action objects executed in order — e.g. [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."}] or [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."},{"action":"key","key":"Enter"}]. Combine "press a field" + "type text" into a single array instead of separate replies. Do NOT put a "navigate" or "done" action before other actions.\n\nUSER REQUEST:\n' + JSON.stringify(userMessage) }]
+                        parts: [{ type: 'text', text: `${promptSystem}\n\n---\nUSER REQUEST:\n${JSON.stringify(userMessage)}` }]
                     };
                 }
 
@@ -2078,66 +1775,44 @@
             const latency = Math.round(performance.now() - startTime);
             clearInterval(planTimer);
 
-            addLog('PLAN', `Plan: [${plan.length} action(s)] ${plan.map(p => (p.action || '').toUpperCase()).join(' -> ')} (${latency}ms)`, plan);
+            addLog('PLAN', `Plan: [${(plan.action || '').toUpperCase()}] ${plan.thought || ''} (${latency}ms)`, plan);
 
-            // Execute the action SEQUENCE (1..N actions) in order within this single
-            // planner round-trip. This lets the agent, e.g., focus a field then type
-            // into it — or click + type + press Enter — without prompting the LLM
-            // again for every micro-step.
-            let finished = false;
-            let finishedResult = null;
-            for (let ai = 0; ai < plan.length; ai++) {
-                const p = plan[ai];
-                STATE.agentMood = 'acting';
-                STATE.statusText = `Acting (${ai + 1}/${plan.length}): ${p.thought || p.action || 'Executing step'}`;
-                updateHUD();
+            STATE.agentMood = 'acting';
+            STATE.statusText = `Acting: ${plan.thought || plan.action || 'Executing step'}`;
+            updateHUD();
 
-                const outcome = await executeAction(p, elements);
+            const outcome = await executeAction(plan, elements);
 
-                // CONFIRM the action really landed (type/clear/select). If verification
-                // failed, remember it so the NEXT plan request tells the model to retry
-                // a different way instead of lying that the field was filled.
-                if (outcome && outcome.verified === false) {
-                    addLog('WARN', `Verification FAILED for '${outcome.verifyAction}': expected text not found in the field. Actual content: "${(outcome.actual || '').slice(0, 60)}" — will ask planner to retry a different way.`);
-                    STATE.verifyFeedback = `PREVIOUS ACTION VERIFICATION FAILED: your '${outcome.verifyAction}' action did NOT actually place the text into the field (the field currently contains: "${ (outcome.actual || '').slice(0, 80) }"). The element may be the wrong one, not focused, or it is a framework-controlled input. RETRY A DIFFERENT WAY: try clicking into the field first, choose a different element id from the list, or type character-by-character. Do NOT report the goal as done until the body field visibly contains the text.`;
-                } else if (outcome && outcome.verified === true) {
-                    STATE.verifyFeedback = '';
-                }
-
-                STATE.history.push({
-                    step: STATE.stepCount + 1,
-                    action: p.action,
-                    elementId: p.elementId,
-                    thought: p.thought,
-                    timestamp: new Date().toLocaleTimeString()
-                });
-                STATE.stepCount++;
-
-                // Persist after every committed action so a full page navigation
-                // (e.g. clicking a link / Google result / pressing Enter) resumes on
-                // the next page.
-                persistState();
-
-                // A 'done' action ends the run. A navigation changes the page, so any
-                // following actions in the sequence would target stale elements — stop
-                // the sequence and let the run resume (or finish) on the new page.
-                if (outcome && outcome.finished) {
-                    finished = true;
-                    finishedResult = outcome.result;
-                    break;
-                }
-                if (p.action === 'navigate') break;
-                // If a type/select/clear verification failed, stop and let the next
-                // planner call retry a different way.
-                if (outcome && outcome.verified === false) break;
+            // CONFIRM the action really landed (type/clear/select). If verification
+            // failed, remember it so the NEXT plan request tells the model to retry
+            // a different way instead of lying that the field was filled.
+            if (outcome && outcome.verified === false) {
+                addLog('WARN', `Verification FAILED for '${outcome.verifyAction}': expected text not found in the field. Actual content: "${(outcome.actual || '').slice(0, 60)}" — will ask planner to retry a different way.`);
+                STATE.verifyFeedback = `PREVIOUS ACTION VERIFICATION FAILED: your '${outcome.verifyAction}' action did NOT actually place the text into the field (the field currently contains: "${ (outcome.actual || '').slice(0, 80) }"). The element may be the wrong one, not focused, or it is a framework-controlled input. RETRY A DIFFERENT WAY: try clicking into the field first, choose a different element id from the list, or type character-by-character. Do NOT report the goal as done until the body field visibly contains the text.`;
+            } else if (outcome && outcome.verified === true) {
+                STATE.verifyFeedback = '';
             }
 
-            if (finished) {
+            STATE.history.push({
+                step: STATE.stepCount + 1,
+                action: plan.action,
+                elementId: plan.elementId,
+                thought: plan.thought,
+                timestamp: new Date().toLocaleTimeString()
+            });
+
+            STATE.stepCount++;
+
+            // Persist after every committed step so a full page navigation
+            // (e.g. clicking a link / Google result) resumes on the next page.
+            persistState();
+
+            if (outcome.finished) {
                 STATE.isRunning = false;
                 STATE.agentMood = 'done';
-                STATE.lastResult = finishedResult;
-                STATE.statusText = `Goal Reached: ${finishedResult}`;
-                addLog('SUCCESS', `Goal Finished: ${finishedResult}`);
+                STATE.lastResult = outcome.result;
+                STATE.statusText = `Goal Reached: ${outcome.result}`;
+                addLog('SUCCESS', `Goal Finished: ${outcome.result}`);
                 clearBadges();
                 updateHUD();
                 persistState();
@@ -2181,34 +1856,11 @@
         STATE.stepCount = 0;
         STATE.history = [];
         STATE.runStartedAt = Date.now();
-        STATE.runId = 'run_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
         kiloSessionId = null;
         kiloSessionPromise = null;
         STATE.agentMood = 'scanning';
         STATE.statusText = 'Starting autonomous agent loop...';
         addLog('INFO', `Started agent with goal: "${STATE.goal}"`);
-        // Archive the full effective app configuration for this run so logs are
-        // self-describing (which model/server/toggles produced these actions).
-        try {
-            const c = getConfig();
-            const settingsSnapshot = {
-                goal: STATE.goal,
-                provider: c.PROVIDER,
-                model: c.KILO_MODEL || c.MODEL,
-                server: c.SERVER,
-                ai_base: c.KILO_AI_BASE,
-                max_steps: c.MAX_STEPS,
-                step_delay_ms: c.STEP_DELAY_MS,
-                verify_fields: !!c.VERIFY_FIELDS,
-                allow_heuristic: !!c.ALLOW_HEURISTIC_FALLBACK,
-                enable_badges: !!c.ENABLE_BADGES,
-                llm_retries: c.LLM_RETRIES,
-                reasoning_effort: c.REASONING_EFFORT,
-                element_text_limit: c.ELEMENT_TEXT_LIMIT,
-                log_server: { enabled: !!(c.LOG_SERVER && c.LOG_SERVER.ENABLED), ns: c.LOG_SERVER && c.LOG_SERVER.NS, app: c.LOG_SERVER && c.LOG_SERVER.APP }
-            };
-            addLog('CONFIG', 'Agent run configuration', settingsSnapshot);
-        } catch (_) {}
         updateHUD();
         persistState();
         setTimeout(runAgentStep, 100);
@@ -2263,10 +1915,10 @@
         const style = document.createElement('style');
         style.textContent = `
             * { box-sizing: border-box; margin: 0; padding: 0; }
-            :host { position: fixed; inset: 0; pointer-events: none; transform: translateZ(0); overflow: visible; }
+            :host { position: fixed; bottom: 20px !important; right: 20px !important; left: auto !important; top: auto !important; }
             .panel, .agent-fab, .agent-pill-wrapper { pointer-events: auto; }
             .hud-container { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; animation: hudIn .25s cubic-bezier(.2,.8,.2,1); }
-            @keyframes hudIn { from { opacity: 0; } to { opacity: 1; } }
+            @keyframes hudIn { from { opacity: 0; transform: translateY(10px) scale(.97); } to { opacity: 1; transform: none; } }
             @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
             @keyframes orbPulse { 0%,100% { box-shadow: 0 0 10px #00f3ff, 0 0 20px #00f3ff; } 50% { box-shadow: 0 0 18px #00f3ff, 0 0 32px #00f3ff, 0 0 44px #00f3ff; } }
 
@@ -2282,7 +1934,7 @@
 
             /* Main Floating Action Button (FAB) */
             .agent-fab {
-                position: absolute;
+                position: fixed;
                 bottom: 20px;
                 right: 20px;
                 width: 48px;
@@ -2307,7 +1959,7 @@
 
             /* Minimized Floating Pill (status indicator, center-bottom) */
             .agent-pill-wrapper {
-                position: absolute;
+                position: fixed;
                 bottom: 24px;
                 left: 50%;
                 transform: translateX(-50%);
@@ -2711,7 +2363,7 @@
                 }
                 .hud-container { align-items: stretch; justify-content: flex-end; height: 100%; gap: 10px; }
                 .agent-fab {
-                    position: absolute; right: 14px; bottom: calc(16px + env(safe-area-inset-bottom));
+                    position: fixed; right: 14px; bottom: calc(16px + env(safe-area-inset-bottom));
                     width: 54px; height: 54px;
                 }
                 :host(.panel-open) .agent-fab, :host(.panel-open) .agent-pill-wrapper { display: none; }
@@ -2782,7 +2434,6 @@
                                     <button class="tab-btn active" data-tab="server">🖧 Server</button>
                                     <button class="tab-btn" data-tab="models">🧠 Models</button>
                                     <button class="tab-btn" data-tab="behavior">⚙️ Behavior</button>
-                                    <button class="tab-btn" data-tab="logserver">📡 Logs</button>
                                 </div>
                                 <div id="tab-server" class="tab-panel">
                                     <div class="field-row"><label class="field-label">Server:</label><select id="cfg-server" class="field-select"><option value="devproject">DevProject — 4096 (/ai) · DEFAULT</option><option value="local">Local OpenCode — 127.0.0.1:4096</option><option value="kilo4097">Kilo Server — 4097 (/v1)</option><option value="custom">Custom Server…</option></select></div>
@@ -2792,18 +2443,7 @@
                                     <div id="kilo-auth-row" class="field-row"><label class="field-label">Kilo Shared Secret (X-Kilo-Auth):</label><input id="cfg-kiloauth" type="password" class="field-input" placeholder="shared secret for /ai" /></div>
                                     <div id="kilo-dir-row" class="field-row"><label class="field-label">Working Directory:</label><input id="cfg-kilodir" type="text" class="field-input" placeholder="/" /></div>
                                     <div class="field-label" style="color:#7dd3fc; font-size:10px; line-height:1.3;">Default planner runs on 4096 (/ai) as the apex-browser agent — a tool-locked, in-page planner. It returns a plan JSON this script executes locally.</div>
-                                 </div>
-                                 <div id="tab-logserver" class="tab-panel" style="display:none;">
-                                     <div class="field-row" style="flex-direction:row; align-items:center; justify-content:space-between; gap:8px;"><label class="field-label" style="display:flex; align-items:center; gap:4px; cursor:pointer; color:#34d399;"><input id="cfg-logserver-enabled" type="checkbox" /> Ship logs to Live Log Server</label></div>
-                                     <div class="field-row"><label class="field-label">Log Server URL:</label><input id="cfg-logserver-url" type="text" class="field-input" placeholder="https://logs.devproject.vip/api/ingest" /></div>
-                                     <div class="field-row"><label class="field-label">Namespace:</label><input id="cfg-logserver-ns" type="text" class="field-input" placeholder="apex-agent" /></div>
-                                     <div class="field-row"><label class="field-label">App name:</label><input id="cfg-logserver-app" type="text" class="field-input" placeholder="apex-kilo-agent" /></div>
-                                     <div class="field-row"><label class="field-label">Tags (csv):</label><input id="cfg-logserver-tags" type="text" class="field-input" placeholder="userscript,browser" /></div>
-                                     <div class="field-row"><label class="field-label">Write Token:</label><input id="cfg-logserver-token" type="password" class="field-input" placeholder="(optional)" /></div>
-                                     <div class="field-row"><label class="field-label">Flush ms:</label><input id="cfg-logserver-flush" type="number" class="field-input" style="width:90px;" min="500" max="30000" /></div>
-                                     <div class="field-row" style="margin-top:4px;"><a id="btn-view-live-logs" class="text-link-btn" target="_blank" rel="noopener">🔎 Open Live Log Viewer</a></div>
-                                     <div class="field-label" style="color:#94a3b8; font-size:10px; line-height:1.3;">All levels (incl. verbose/debug/errors) are archived to the server. View them at logs.devproject.vip or via <code>tail -f log-server/logs/&lt;ns&gt;/&lt;date&gt;.jsonl</code>.</div>
-                                 </div>
+                                </div>
                                 <div id="tab-models" class="tab-panel" style="display:none;">
                                     <div class="field-row"><label class="field-label">Provider (4096 /ai):</label><select id="cfg-provpicker" class="field-select"></select></div>
                                     <div class="field-row"><label class="field-label">Session Model:</label><select id="cfg-kilomodel" class="field-select model-select"></select><input id="cfg-kilomodel-custom" type="text" class="field-input" placeholder="provider/model" style="display:none; margin-top:4px;" /></div>
@@ -2829,7 +2469,7 @@
                 <div class="agent-panel-container">
                     <header class="panel-header">
                         <button id="minimize-panel-btn" class="icon-btn" aria-label="Minimize Panel"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"></polyline></svg></button>
-                        <div class="panel-title-group"><h1 class="panel-title">AUTONOMOUS AGENT</h1><span class="version-tag">v8.10</span></div>
+                        <div class="panel-title-group"><h1 class="panel-title">AUTONOMOUS AGENT</h1><span class="version-tag">v8.5</span></div>
                         <div class="header-actions">
                             <button id="open-config-btn" class="icon-btn" aria-label="Settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg></button>
                             <button id="close-panel-btn" class="icon-btn" aria-label="Close Agent"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>
@@ -2944,15 +2584,14 @@
         const pauseLabel = shadowRoot.getElementById('pause-agent-label');
         const stopBtn = shadowRoot.getElementById('stop-agent-btn');
 
-        // Settings tabs (Server / Models / Behavior / Logs) so the modal never overflows.
+        // Settings tabs (Server / Models / Behavior) so the modal never overflows.
         const tabServer = shadowRoot.getElementById('tab-server');
         const tabModels = shadowRoot.getElementById('tab-models');
         const tabBehavior = shadowRoot.getElementById('tab-behavior');
-        const tabLogServer = shadowRoot.getElementById('tab-logserver');
         const tabBtns = Array.from(shadowRoot.querySelectorAll('.tab-btn'));
         function showSettingsTab(name) {
             STATE.settingsTab = name;
-            const map = { server: tabServer, models: tabModels, behavior: tabBehavior, logserver: tabLogServer };
+            const map = { server: tabServer, models: tabModels, behavior: tabBehavior };
             Object.keys(map).forEach(k => { if (map[k]) map[k].style.display = (k === name) ? 'flex' : 'none'; });
             tabBtns.forEach(b => b.classList.toggle('active', b.dataset.tab === name));
             if (settingsFragment) settingsFragment.scrollTop = 0;
@@ -3001,16 +2640,9 @@
             updateHUD();
         };
 
-        if (pillPauseBtn) pillPauseBtn.onclick = (e) => {
-            if (e) e.stopPropagation();
+        if (pillPauseBtn) pillPauseBtn.onclick = () => {
             if (STATE.isRunning) stopAgent();
             else startAgent();
-        };
-        // Tap the pill to open the live session / logs panel with verbose auto-enabled (debug view).
-        if (pillWrapper) pillWrapper.onclick = () => {
-            STATE.verbose = true;
-            STATE.panelOpen = true;
-            updateHUD();
         };
 
         if (closeConfigBtn) closeConfigBtn.onclick = () => {
@@ -3262,32 +2894,6 @@
         const llmRetriesInp = shadowRoot.getElementById('cfg-llm-retries');
         const verifyToggle = shadowRoot.getElementById('cfg-verify-toggle');
 
-        // ---- Live Log Server settings ----
-        const lsEnabled = shadowRoot.getElementById('cfg-logserver-enabled');
-        const lsUrl = shadowRoot.getElementById('cfg-logserver-url');
-        const lsNs = shadowRoot.getElementById('cfg-logserver-ns');
-        const lsApp = shadowRoot.getElementById('cfg-logserver-app');
-        const lsTags = shadowRoot.getElementById('cfg-logserver-tags');
-        const lsToken = shadowRoot.getElementById('cfg-logserver-token');
-        const lsFlush = shadowRoot.getElementById('cfg-logserver-flush');
-        const lsViewBtn = shadowRoot.getElementById('btn-view-live-logs');
-        const lsCfg = currentCfg.LOG_SERVER || {};
-        if (lsEnabled) lsEnabled.checked = lsCfg.ENABLED !== false;
-        if (lsUrl) lsUrl.value = lsCfg.URL || 'https://logs.devproject.vip/api/ingest';
-        if (lsNs) lsNs.value = lsCfg.NS || 'apex-agent';
-        if (lsApp) lsApp.value = lsCfg.APP || 'apex-kilo-agent';
-        if (lsTags) lsTags.value = lsCfg.TAGS || 'userscript,browser';
-        if (lsToken) lsToken.value = lsCfg.TOKEN || '';
-        if (lsFlush) lsFlush.value = lsCfg.FLUSH_MS || 2500;
-        if (lsViewBtn) {
-            const viewerUrl = () => {
-                const ns = (lsNs && lsNs.value.trim()) || (lsCfg.NS || 'apex-agent');
-                return 'https://logs.devproject.vip/?ns=' + encodeURIComponent(ns);
-            };
-            lsViewBtn.href = viewerUrl();
-            lsViewBtn.onclick = () => { try { lsViewBtn.href = viewerUrl(); } catch (_) {} };
-        }
-
         providerSel.value = currentCfg.PROVIDER || 'devproject';
         apikeyInp.value = currentCfg.API_KEY || '';
         kiloAuthInp.value = currentCfg.KILO_AUTH || '';
@@ -3333,19 +2939,7 @@
                 VERIFY_FIELDS: verifyToggle.checked,
                 AUTO_EXECUTE: !!(autoExecToggle && autoExecToggle.checked),
                 MAX_STEPS: maxSteps,
-                LLM_RETRIES: retries,
-                LOG_SERVER: {
-                    ENABLED: !!(lsEnabled && lsEnabled.checked),
-                    URL: (lsUrl && lsUrl.value.trim()) || 'https://logs.devproject.vip/api/ingest',
-                    NS: (lsNs && lsNs.value.trim()) || 'apex-agent',
-                    APP: (lsApp && lsApp.value.trim()) || 'apex-kilo-agent',
-                    TOKEN: (lsToken && lsToken.value.trim()) || '',
-                    TAGS: (lsTags && lsTags.value.trim()) || 'userscript,browser',
-                    REPO: lsCfg.REPO || 'https://github.com/chicanoandres702/apex-kilo-agent',
-                    BRANCH: lsCfg.BRANCH || 'master',
-                    COMMIT: lsCfg.COMMIT || '58e0005',
-                    FLUSH_MS: Math.max(500, parseInt(lsFlush && lsFlush.value, 10) || 2500)
-                }
+                LLM_RETRIES: retries
             });
             if (domGlowToggle && badgesToggle) domGlowToggle.checked = badgesToggle.checked;
             if (modelNameLabel && typeof readModelValue === 'function') {
@@ -3357,8 +2951,7 @@
         // Auto-save whenever any field changes so models and settings always persist.
         [serverSel, aiBaseInp, baseUrlInp, providerSel, apikeyInp, kiloAuthInp, kiloDirInp,
          kiloModelSel, kiloModelCustom, badgesToggle,
-         heuristicToggle, verifyToggle, llmRetriesInp, maxStepsInput, domGlowToggle, autoExecToggle,
-         lsEnabled, lsUrl, lsNs, lsApp, lsTags, lsToken, lsFlush
+         heuristicToggle, verifyToggle, llmRetriesInp, maxStepsInput, domGlowToggle, autoExecToggle
         ].forEach(el => {
             if (!el) return;
             el.addEventListener('change', saveConfigFromUI);
@@ -3457,14 +3050,7 @@
             const pillText = pillWrapper.querySelector('.status-text');
             if (pillText) {
                 const labels = { scanning: 'Scanning…', thinking: 'Thinking…', acting: 'Acting…', done: 'Done', error: 'Error', idle: 'Idle' };
-                // While a run is in progress, show the LIVE status (e.g. "Synthesizing plan… (12s)")
-                // so the pill never reads "Idle" while the agent is actually still working.
-                if (STATE.isRunning && STATE.statusText) {
-                    const live = STATE.statusText;
-                    pillText.innerText = live.length > 34 ? live.slice(0, 33) + '…' : live;
-                } else {
-                    pillText.innerText = (mood === 'error') ? 'Error' : (STATE.isRunning ? (labels[mood] || 'Working…') : 'Idle');
-                }
+                pillText.innerText = (mood === 'error') ? 'Error' : (STATE.isRunning ? (labels[mood] || 'Working…') : 'Idle');
             }
         }
         const pillPauseBtn = shadowRoot.getElementById('pill-pause-btn');
@@ -3561,30 +3147,20 @@
     // =========================================================================
     function init() {
         ensureHUD();
-        if (!STATE.sessionId) STATE.sessionId = 'sess_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', () => {
                 ensureHUD();
-                addLog('INFO', 'Autonomous Browser Agent v8.10 ready.');
+                addLog('INFO', 'Autonomous Browser Agent v8.4 ready.');
                 maybeResumeRun();
             });
         } else {
             ensureHUD();
-            addLog('INFO', 'Autonomous Browser Agent v8.10 ready.');
+            addLog('INFO', 'Autonomous Browser Agent v8.4 ready.');
             maybeResumeRun();
         }
 
         // Periodically monitor DOM to ensure SPA route transitions never detach the HUD floating FAB/pill
         setInterval(ensureHUD, 1000);
-
-        // Flush queued logs to the server on page hide / unload so nothing is lost.
-        if (typeof window !== 'undefined') {
-            window.addEventListener('beforeunload', () => { try { flushLogShip(); } catch (_) {} });
-            window.addEventListener('pagehide', () => { try { flushLogShip(); } catch (_) {} });
-            document.addEventListener('visibilitychange', () => {
-                if (document.visibilityState === 'hidden') { try { flushLogShip(); } catch (_) {} }
-            });
-        }
     }
 
     // Resume a run that was in-progress when the previous page navigated away.
