@@ -1674,7 +1674,18 @@
                         }
                     } else {
                         addLog('ERR', `Kilo API ${method} ${endpoint} failed HTTP ${res.status} (${latency}ms)`, { status: res.status, body: res.responseText ? res.responseText.slice(0, 800) : undefined });
-                        reject(new Error(`Kilo HTTP ${res.status}: ${res.responseText}`));
+                        let errMsg = `Kilo HTTP ${res.status}: ${res.responseText || 'Unknown error'}`;
+                        try {
+                            const errJson = JSON.parse(res.responseText);
+                            if (errJson && errJson.data && errJson.data.message) {
+                                errMsg = `Kilo HTTP ${res.status}: ${errJson.data.message} (ref: ${errJson.data.ref || 'none'})`;
+                            }
+                        } catch (_) {}
+                        const err = new Error(errMsg);
+                        err.type = 'http';
+                        err.httpStatus = res.status;
+                        err.responseText = res.responseText;
+                        reject(err);
                     }
                 },
                 onerror: (err) => reject(new Error('Kilo network error: ' + err)),
@@ -1908,12 +1919,13 @@
                             modelID = km;
                         }
                     }
+                    const selectedAgent = (attempt === 0 ? 'plan' : (attempt === 1 ? 'code' : undefined));
                     body = {
                         messageID: makeMsgId(),
-                        agent: 'apex-browser',
+                        ...(selectedAgent ? { agent: selectedAgent } : {}),
                         reasoningEffort: config.REASONING_EFFORT || 'low',
                         model: { providerID: providerID, modelID: modelID },
-                        parts: [{ type: 'text', text: 'You are the apex-browser planner. Respond with a single JSON plan object OR a JSON ARRAY of 2-4 action objects (no markdown, no code fences, no prose) using this schema: {thought, action, elementId, text, url, target, key, direction, durationMs, answer}. BATCHING RULE: when the goal requires multiple local UI steps on the same page, you MUST return them as ONE JSON ARRAY of action objects executed in order — e.g. [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."}] or [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."},{"action":"key","key":"Enter"}]. Combine "press a field" + "type text" into a single array instead of separate replies. Do NOT put a "navigate" or "done" action before other actions.\n\nUSER REQUEST:\n' + JSON.stringify(userMessage) }]
+                        parts: [{ type: 'text', text: 'You are the autonomous web automation action planner. Respond with a single JSON plan object OR a JSON ARRAY of 2-4 action objects (no markdown, no code fences, no prose) using this schema: {thought, action, elementId, text, url, target, key, direction, durationMs, answer}. BATCHING RULE: when the goal requires multiple local UI steps on the same page, you MUST return them as ONE JSON ARRAY of action objects executed in order — e.g. [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."}] or [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."},{"action":"key","key":"Enter"}]. Combine "press a field" + "type text" into a single array instead of separate replies. Do NOT put a "navigate" or "done" action before other actions.\n\nUSER REQUEST:\n' + JSON.stringify(userMessage) }]
                     };
                 }
 

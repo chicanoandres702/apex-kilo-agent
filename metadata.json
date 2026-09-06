@@ -1,0 +1,6 @@
+{
+  "name": "Apex Kilo Autonomous Agent",
+  "description": "Autonomous browser agent studio featuring deep DOM & Shadow DOM scanner, numerical badge overlays, multi-provider LLM reasoning (Kilo Code, Gemini, Heuristic), in-page HUD, and interactive test arena.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
