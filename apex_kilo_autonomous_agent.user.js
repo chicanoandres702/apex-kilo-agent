@@ -174,41 +174,62 @@
         });
          if (typeof GM_xmlhttpRequest !== 'undefined') {
              GM_xmlhttpRequest(wrapped);
-         } else if (typeof fetch !== 'undefined') {
-             const timeoutMs = options.timeout || 15000;
-             const ac = new AbortController();
-             let settled = false;
-             const to = setTimeout(() => {
-                 if (settled) return;
-                 settled = true;
-                 ac.abort();
-                 if (options.ontimeout) options.ontimeout();
-                 else if (options.onerror) options.onerror({ error: 'timeout' });
-             }, timeoutMs);
-             fetch(options.url, {
-                 method: options.method || 'POST',
-                 headers: options.headers || {},
-                 body: options.data,
-                 signal: ac.signal
-             })
-             .then(async (res) => {
-                 if (settled) return;
-                 settled = true;
-                 clearTimeout(to);
-                 const text = await res.text();
-                 if (wrapped.onload) wrapped.onload({ status: res.status, responseText: text });
-             })
-             .catch((err) => {
-                 if (settled) return;
-                 settled = true;
-                 clearTimeout(to);
-                 if (err && err.name === 'AbortError' && options.ontimeout) {
-                     options.ontimeout();
-                 } else if (options.onerror) {
-                     options.onerror(err);
-                 }
-             });
-         }
+          } else if (typeof fetch !== 'undefined') {
+              const timeoutMs = options.timeout || 15000;
+              const maxRetries = options.maxRetries != null ? options.maxRetries : 2;
+              const baseUrl = options.url;
+              const baseOpts = {
+                  method: options.method || 'POST',
+                  headers: options.headers || {},
+                  body: options.data,
+              };
+              let attempt = 0;
+              let settled = false;
+
+              function attemptFetch() {
+                  const ac = new AbortController();
+                  const to = setTimeout(() => {
+                      if (settled) return;
+                      ac.abort();
+                      if (options.ontimeout) options.ontimeout();
+                      else if (options.onerror) options.onerror({ error: 'timeout' });
+                  }, timeoutMs);
+                  fetch(options.url, { ...baseOpts, signal: ac.signal })
+                      .then(async (res) => {
+                          if (settled) return;
+                          const text = await res.text();
+                          if (res.status >= 500 && attempt < maxRetries && !settled) {
+                              settled = true;
+                              clearTimeout(to);
+                              const delay = Math.pow(2, attempt) * 1000;
+                              attempt++;
+                              addLog('NET', `Retrying ${options.method || 'POST'} ${baseUrl} (attempt ${attempt}/${maxRetries}) in ${delay}ms — HTTP ${res.status}`, null, true);
+                              setTimeout(attemptFetch, delay);
+                              return;
+                          }
+                          settled = true;
+                          clearTimeout(to);
+                          if (wrapped.onload) wrapped.onload({ status: res.status, responseText: text });
+                      })
+                      .catch((err) => {
+                          if (settled) return;
+                          clearTimeout(to);
+                          if (err && err.name === 'AbortError') {
+                              if (attempt < maxRetries) {
+                                  const delay = Math.pow(2, attempt) * 1000;
+                                  attempt++;
+                                  addLog('NET', `Retrying ${options.method || 'POST'} ${baseUrl} (attempt ${attempt}/${maxRetries}) in ${delay}ms — AbortError`, null, true);
+                                  setTimeout(attemptFetch, delay);
+                                  return;
+                              }
+                              if (options.ontimeout) options.ontimeout();
+                          } else {
+                              if (options.onerror) options.onerror(err);
+                          }
+                      });
+              }
+              attemptFetch();
+          }
      }
 
     let STATE = {
@@ -1073,11 +1094,76 @@
             }
             if ((keyName === 'Enter' || keyName === 'Return') && targetEl.form) {
                 try {
-                    if (typeof targetEl.form.requestSubmit === 'function') targetEl.form.requestSubmit();
-                    else targetEl.form.submit();
-                    persistState();
+                    const beforeUrl = window.location.href;
+                    addLog('ACT', `Key "${keyName}" on element with form: form=${!!targetEl.form}, form.action="${targetEl.form?.action || 'N/A'}", input.value="${String(targetEl.value || '').slice(0, 60)}"`, null, true);
+                    addLog('ACT', `Form submission check: beforeUrl="${beforeUrl.slice(0,80)}"`, { beforeUrl }, true);
+                    addLog('ACT', `Input value: "${String(targetEl.value || text || '').slice(0, 60)}"`, { val: targetEl.value, text: text, name: targetEl.name, id: targetEl.id, formAction: targetEl.form.action }, true);
+                    
+                    // Wikipedia and many sites use JS to intercept Enter and do a
+                    // custom submit. Dispatch a proper 'keydown' event with Enter so
+                    // any JS handler can intercept it.
+                    if (targetEl.form) {
+                        try {
+                            const enterEvent = new KeyboardEvent('keydown', {
+                                key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                                bubbles: true, cancelable: true
+                            });
+                            targetEl.dispatchEvent(enterEvent);
+                        } catch (e) {}
+                    }
+                    
+                    // Wait briefly to see if JS intercepted the Enter and submitted
                     await new Promise(r => setTimeout(r, 800));
-                    return { success: true, pressed: keyName, submitted: true };
+                    if (window.location.href !== beforeUrl) {
+                        persistState();
+                        STATE.history.push({ step: STATE.stepCount + 1, action: 'navigate', thought: 'Form submitted via JS handler', timestamp: new Date().toLocaleTimeString() });
+                        return { success: true, pressed: keyName, submitted: true };
+                    }
+                    
+                    // Try form.requestSubmit() (fires submit event, respects JS handlers)
+                    try {
+                        if (typeof targetEl.form.requestSubmit === 'function') {
+                            targetEl.form.requestSubmit();
+                        }
+                    } catch (e) {}
+                    await new Promise(r => setTimeout(r, 800));
+                    if (window.location.href !== beforeUrl) {
+                        persistState();
+                        addLog('ACT', `Form submitted via requestSubmit`, null, true);
+                        return { success: true, pressed: keyName, submitted: true };
+                    }
+                    
+                    // Direct form.submit() — bypasses JS but may not include all fields
+                    try { targetEl.form.submit(); } catch (e) {}
+                    await new Promise(r => setTimeout(r, 1000));
+                    if (window.location.href !== beforeUrl) {
+                        persistState();
+                        addLog('ACT', `Form submitted via direct submit()`, null, true);
+                        return { success: true, pressed: keyName, submitted: true };
+                    }
+                    
+                    // Last resort: manually construct the search URL from the form
+                    // action + input values and navigate directly. This guarantees
+                    // navigation even if all JS/submit methods are blocked.
+                    const inputVal = targetEl.value || text || '';
+                    addLog('ACT', `Last resort: inputVal="${String(inputVal).slice(0, 60)}"`, null, true);
+                    const formAction = targetEl.form.action || targetEl.form.getAttribute('action') || window.location.href;
+                    if (inputVal) {
+                        addLog('ACT', `Manual URL navigation: formAction="${formAction}"`, null, true);
+                        const searchUrl = new URL(formAction, window.location.href);
+                        const formData = new FormData(targetEl.form);
+                        // Ensure the current input value is included
+                        const inputName = targetEl.name || targetEl.id || 'search';
+                        searchUrl.searchParams.set(inputName, inputVal);
+                        // Include all other form fields
+                        for (const [k, v] of formData.entries()) {
+                            if (k && v) searchUrl.searchParams.set(k, String(v));
+                        }
+                        persistState();
+                        window.location.href = searchUrl.toString();
+                        await new Promise(r => setTimeout(r, 1500));
+                        return { success: true, pressed: keyName, submitted: true };
+                    }
                 } catch (e) {}
             }
             await new Promise(r => setTimeout(r, config.STEP_DELAY_MS));
@@ -1614,6 +1700,28 @@
         // Reconcile apex-browser agent schema field names with the in-page executor.
         if (!rawObj.text && rawObj.url != null) rawObj.text = rawObj.url;
         if (rawObj.toElementId == null && rawObj.target != null && typeof rawObj.target === 'number') rawObj.toElementId = rawObj.target;
+        // --- DevProject plan agent schema reconciliation ---
+        // The DevProject `plan` agent may emit Playwright-style actions:
+        //   {"action": "press", "keys": "Enter"}  -> {"action": "key", "key": "Enter"}
+        //   {"action": "click", "target": {"id": 1}} -> {"action": "click", "elementId": 1}
+        //   {"action": "type", "target": {"id": 1}, "text": "..."} -> elementId extracted
+        if (!rawObj.text && rawObj.text !== undefined && rawObj.text === undefined) rawObj.text = rawObj.text;
+        // Map "keys" field to "key" (Playwright-style press_key -> our key action).
+        if (rawObj.key === undefined && rawObj.keys !== undefined) rawObj.key = rawObj.keys;
+        // Map "press" action to "key" action.
+        if (rawObj.action === 'press') rawObj.action = 'key';
+        // Extract elementId from target.id (Playwright-style) or target.selector.
+        if (rawObj.elementId === undefined && rawObj.target != null) {
+            if (typeof rawObj.target === 'object' && rawObj.target.id != null) {
+                rawObj.elementId = rawObj.target.id;
+            } else if (typeof rawObj.target === 'number') {
+                rawObj.elementId = rawObj.target;
+            }
+        }
+        // Clean up reconciled fields that the executor doesn't use.
+        if (rawObj.target && typeof rawObj.target === 'object') delete rawObj.target;
+        if (rawObj.keys !== undefined) delete rawObj.keys;
+        
         const norm = normalizePlanAction(getRawAction(rawObj));
         if (!norm) return null;
         rawObj.action = norm;
@@ -1624,6 +1732,8 @@
         // Actions that need a target value must include it.
         if ((rawObj.action === 'type' || rawObj.action === 'select') && (rawObj.text === undefined || rawObj.text === null)) return null;
         if (rawObj.action === 'navigate' && (!rawObj.text || !/^https?:\/\//i.test(rawObj.text))) return null;
+        // 'key' actions need a 'key' field.
+        if (rawObj.action === 'key' && (!rawObj.key || typeof rawObj.key !== 'string')) return null;
         return rawObj;
     }
 
@@ -1674,7 +1784,8 @@
         const { url, headers } = getEndpointAndHeaders(cfg);
         const endpoint = url.replace(/\/+$/, '') + path;
         const startT = (typeof performance !== 'undefined') ? performance.now() : Date.now();
-        addLog('PLAN', `Kilo API ${method} ${endpoint}`, { timeoutMs: timeoutMs || 15000, bodyBytes: body ? JSON.stringify(body).length : 0 }, true);
+        const maxRetries = (typeof cfg.LLM_RETRIES === 'number') ? cfg.LLM_RETRIES : 2;
+        addLog('PLAN', `Kilo API ${method} ${endpoint}`, { timeoutMs: timeoutMs || 15000, maxRetries: maxRetries, bodyBytes: body ? JSON.stringify(body).length : 0 }, true);
         return new Promise((resolve, reject) => {
             execApiRequest({
                 method: method,
@@ -1682,6 +1793,7 @@
                 headers: headers,
                 data: body ? JSON.stringify(body) : undefined,
                 timeout: (timeoutMs || 15000),
+                maxRetries: maxRetries,
                 onload: (res) => {
                     const latency = (typeof performance !== 'undefined') ? Math.round(performance.now() - startT) : 0;
                     if (res.status >= 200 && res.status < 300) {
@@ -1709,8 +1821,16 @@
                         reject(err);
                     }
                 },
-                onerror: (err) => reject(new Error('Kilo network error: ' + err)),
-                ontimeout: () => reject(new Error('Kilo request timed out'))
+                onerror: (err) => {
+                    const latency = (typeof performance !== 'undefined') ? Math.round(performance.now() - startT) : 0;
+                    addLog('ERR', `Kilo network error after ${latency}ms on ${method} ${endpoint}: ${err && err.error ? err.error : (err || 'unknown')}`, err, true);
+                    reject(new Error('Kilo network error: ' + err));
+                },
+                ontimeout: () => {
+                    const latency = (typeof performance !== 'undefined') ? Math.round(performance.now() - startT) : 0;
+                    addLog('ERR', `Kilo request timed out after ${latency}ms on ${method} ${endpoint}`, null, true);
+                    reject(new Error('Kilo request timed out'));
+                }
             });
         });
     }
@@ -1940,13 +2060,18 @@
                             modelID = km;
                         }
                     }
-                    const selectedAgent = (attempt === 0 ? 'plan' : (attempt === 1 ? 'code' : undefined));
+                    // Do NOT specify an `agent` field for the DevProject path. The server's
+                    // built-in "plan" agent has its own system prompt that overrides ours,
+                    // causing it to output prose+markdown instead of raw JSON. Omitting
+                    // `agent` routes to the default model with our `system` override intact.
+                    const SYSTEM_OVERRIDE = 'You are a pure browser automation action planner. You MUST output ONLY a single valid JSON object or a JSON array of 2-4 action objects. NO thinking text, NO explanation, NO markdown, NO code fences, NO tool calls, NO prose. Output raw JSON only. The JSON schema is: {thought, action, elementId, text, url, target, key, direction, durationMs, answer}. ACTION VALUES: click|touch|drag|type|navigate|scroll|wait|key|tui_sync|done. BATCHING: when the goal requires multiple local UI steps on the same page, return them as ONE JSON ARRAY of action objects in order. Combine "press a field" + "type text" into ONE array. Do NOT put "navigate" or "done" before other actions.';
+                    const USER_PROMPT = 'CRITICAL: Output ONLY raw JSON (a single object or array of 2-4 actions). No thinking, no explanation, no markdown, no code fences, no tool calls. Start output with [ or { now:\\n\\nUSER REQUEST:\\n' + JSON.stringify(userMessage);
                     body = {
                         messageID: makeMsgId(),
-                        ...(selectedAgent ? { agent: selectedAgent } : {}),
+                        system: SYSTEM_OVERRIDE,
                         reasoningEffort: config.REASONING_EFFORT || 'low',
                         model: { providerID: providerID, modelID: modelID },
-                        parts: [{ type: 'text', text: 'You are the autonomous web automation action planner. Respond with a single JSON plan object OR a JSON ARRAY of 2-4 action objects (no markdown, no code fences, no prose) using this schema: {thought, action, elementId, text, url, target, key, direction, durationMs, answer}. BATCHING RULE: when the goal requires multiple local UI steps on the same page, you MUST return them as ONE JSON ARRAY of action objects executed in order — e.g. [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."}] or [{"action":"click","elementId":N},{"action":"type","elementId":N,"text":"..."},{"action":"key","key":"Enter"}]. Combine "press a field" + "type text" into a single array instead of separate replies. Do NOT put a "navigate" or "done" action before other actions.\n\nUSER REQUEST:\n' + JSON.stringify(userMessage) }]
+                        parts: [{ type: 'text', text: USER_PROMPT }]
                     };
                 }
 
@@ -1969,7 +2094,13 @@
                 const retryable = (e && (e.type === 'empty' || e.type === 'net' || e.type === 'timeout' ||
                     (e.type === 'http' && e.httpStatus >= 500) || isParse));
                 if (retryable && attempt < MAX_RETRIES) {
-                    addLog('WARN', `Planner attempt ${attempt + 1}/${MAX_RETRIES + 1} failed (${describeLLMFailure(e)}). Retrying...`);
+                    addLog('WARN', `Planner attempt ${attempt + 1}/${MAX_RETRIES + 1} failed (${describeLLMFailure(e)}). Retrying with fresh session...`);
+                    // Reset the session to clear any corrupted context or empty responses.
+                    // Each retry gets a completely fresh session for clean context.
+                    if (kiloSessionId) {
+                        addLog('PLAN', `Resetting Kilo session to clear failure context`);
+                        kiloSessionId = null;
+                    }
                     await new Promise(r => setTimeout(r, 500));
                     continue;
                 }
