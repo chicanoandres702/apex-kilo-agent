@@ -172,23 +172,44 @@
                 if (options.onerror) options.onerror(err);
             }
         });
-        if (typeof GM_xmlhttpRequest !== 'undefined') {
-            GM_xmlhttpRequest(wrapped);
-        } else if (typeof fetch !== 'undefined') {
-            fetch(options.url, {
-                method: options.method || 'POST',
-                headers: options.headers || {},
-                body: options.data
-            })
-            .then(async (res) => {
-                const text = await res.text();
-                if (wrapped.onload) wrapped.onload({ status: res.status, responseText: text });
-            })
-            .catch((err) => {
-                if (wrapped.onerror) wrapped.onerror(err);
-            });
-        }
-    }
+         if (typeof GM_xmlhttpRequest !== 'undefined') {
+             GM_xmlhttpRequest(wrapped);
+         } else if (typeof fetch !== 'undefined') {
+             const timeoutMs = options.timeout || 15000;
+             const ac = new AbortController();
+             let settled = false;
+             const to = setTimeout(() => {
+                 if (settled) return;
+                 settled = true;
+                 ac.abort();
+                 if (options.ontimeout) options.ontimeout();
+                 else if (options.onerror) options.onerror({ error: 'timeout' });
+             }, timeoutMs);
+             fetch(options.url, {
+                 method: options.method || 'POST',
+                 headers: options.headers || {},
+                 body: options.data,
+                 signal: ac.signal
+             })
+             .then(async (res) => {
+                 if (settled) return;
+                 settled = true;
+                 clearTimeout(to);
+                 const text = await res.text();
+                 if (wrapped.onload) wrapped.onload({ status: res.status, responseText: text });
+             })
+             .catch((err) => {
+                 if (settled) return;
+                 settled = true;
+                 clearTimeout(to);
+                 if (err && err.name === 'AbortError' && options.ontimeout) {
+                     options.ontimeout();
+                 } else if (options.onerror) {
+                     options.onerror(err);
+                 }
+             });
+         }
+     }
 
     let STATE = {
         isRunning: false,
@@ -3273,6 +3294,7 @@
         const heuristicToggle = shadowRoot.getElementById('cfg-heuristic-toggle');
         const llmRetriesInp = shadowRoot.getElementById('cfg-llm-retries');
         const verifyToggle = shadowRoot.getElementById('cfg-verify-toggle');
+        const saveCfgBtn = shadowRoot.getElementById('btn-save-cfg');
 
         // ---- Live Log Server settings ----
         const lsEnabled = shadowRoot.getElementById('cfg-logserver-enabled');
@@ -3406,12 +3428,14 @@
         });
         if (kiloModelSel) kiloModelSel.onchange = () => { if (kiloModelSel.value === '__custom__') { if (kiloModelCustom) kiloModelCustom.style.display = ''; } else { if (kiloModelCustom) kiloModelCustom.style.display = 'none'; } };
 
-        saveCfgBtn.onclick = () => {
-            saveConfigFromUI();
-            STATE.showSettings = false;
-            showSettingsFragment(false);
-            addLog('INFO', 'Saved updated configuration.');
-        };
+        if (saveCfgBtn) {
+            saveCfgBtn.onclick = () => {
+                saveConfigFromUI();
+                STATE.showSettings = false;
+                showSettingsFragment(false);
+                addLog('INFO', 'Saved updated configuration.');
+            };
+        }
     }
 
     function renderConsole() {
