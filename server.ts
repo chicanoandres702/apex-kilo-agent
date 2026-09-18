@@ -27,7 +27,7 @@ async function startServer() {
     res.json({
       status: 'ok',
       agent: 'Apex Kilo Autonomous Agent',
-      version: '8.14.0',
+      version: '8.15.0',
       hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
     });
   });
@@ -48,7 +48,7 @@ async function startServer() {
   app.get('/api/script/raw', (req: Request, res: Response) => {
     if (fs.existsSync(userScriptPath)) {
       const content = fs.readFileSync(userScriptPath, 'utf-8');
-      res.json({ content, version: '8.14.0' });
+      res.json({ content, version: '8.15.0' });
     } else {
       res.status(404).json({ error: 'Userscript file not found' });
     }
@@ -115,7 +115,7 @@ async function startServer() {
       const manifest = {
         manifest_version: 3,
         name: 'Apex Kilo Autonomous Agent',
-        version: '8.14.0',
+        version: '8.15.0',
         description: 'Autonomous browser action agent with deep DOM scanning, numbered badges, in-page HUD, and multi-provider AI planning.',
         permissions: ['activeTab', 'scripting', 'storage'],
         host_permissions: ['<all_urls>'],
@@ -137,7 +137,7 @@ async function startServer() {
       zip.file('manifest.json', JSON.stringify(manifest, null, 2));
 
       // content_script.js: wrapper around userscript logic
-      zip.file('content_script.js', `// Apex Kilo Autonomous Agent v8.14 Content Script\n(function() {\n  console.log('[Apex Kilo] Browser Extension Content Script Injected');\n  ${scriptCode}\n})();\n`);
+      zip.file('content_script.js', `// Apex Kilo Autonomous Agent v8.15 Content Script\n(function() {\n  console.log('[Apex Kilo] Browser Extension Content Script Injected');\n  ${scriptCode}\n})();\n`);
 
       // background.js
       const backgroundJs = `// Apex Kilo Background Service Worker
@@ -313,7 +313,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         <div style="font-size: 10px; color: #94a3b8;">Autonomous In-Browser Agent</div>
       </div>
     </div>
-    <span class="badge">v8.14</span>
+    <span class="badge">v8.15</span>
   </div>
 
   <div class="status-card">
@@ -398,7 +398,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
       const zipBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
       res.setHeader('Content-Type', 'application/zip');
-      res.setHeader('Content-Disposition', 'attachment; filename="apex-kilo-extension-v8.14.zip"');
+      res.setHeader('Content-Disposition', 'attachment; filename="apex-kilo-extension-v8.15.zip"');
       res.send(zipBuffer);
     } catch (err: any) {
       console.error('Error generating extension ZIP:', err);

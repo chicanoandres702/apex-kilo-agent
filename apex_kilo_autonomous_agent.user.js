@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Autonomous Web Browser Agent (Kilo Server Edition)
 // @namespace    http://tampermonkey.net/
-// @version      8.14
+// @version      8.15
 // @updateURL    https://devproject.vip/apex-agent/apex_kilo_autonomous_agent.user.js
 // @downloadURL  https://devproject.vip/apex-agent/apex_kilo_autonomous_agent.user.js
 // @description  Full autonomous browser agent userscript for Tampermonkey. Deep Shadow DOM scanner, visual numbered badges, and LLM reasoning via the Kilo Code CLI server gateway (devproject.vip/ai), ported from Kilocode-Android2.
@@ -133,7 +133,7 @@
         repo: 'https://github.com/chicanoandres702/apex-kilo-agent',
         branch: 'master',
         commit: '58e0005',
-        version: '8.14'
+        version: '8.15'
     };
 
     // Safe GM / LocalStorage abstraction

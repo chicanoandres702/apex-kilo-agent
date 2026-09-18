@@ -658,7 +658,7 @@ export const TestArena: React.FC<TestArenaProps> = ({
                       href="#result-1"
                       className="text-sm font-bold text-cyan-400 hover:underline flex items-center gap-1"
                     >
-                      Apex Kilo Autonomous Agent v8.14 Userscript
+                      Apex Kilo Autonomous Agent v8.15 Userscript
                       <ExternalLink className="w-3 h-3" />
                     </a>
                     <p className="text-xs text-slate-300">

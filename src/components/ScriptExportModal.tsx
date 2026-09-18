@@ -43,7 +43,7 @@ export const ScriptExportModal: React.FC<ScriptExportModalProps> = ({
           }
         })
         .catch(() => {
-          setScriptSnippet('// Apex Kilo Autonomous Agent Userscript (v8.14)\n// Available directly at /apex_kilo_autonomous_agent.user.js');
+          setScriptSnippet('// Apex Kilo Autonomous Agent Userscript (v8.15)\n// Available directly at /apex_kilo_autonomous_agent.user.js');
         });
     }
   }, [isOpen]);
@@ -133,7 +133,7 @@ export const ScriptExportModal: React.FC<ScriptExportModalProps> = ({
                   <FolderArchive className="w-4 h-4 text-cyan-400" />
                   <span>Apex Kilo Chrome Extension ZIP</span>
                   <span className="text-[10px] font-mono px-1.5 py-0.5 bg-cyan-950 text-cyan-300 rounded border border-cyan-800">
-                    v8.14
+                    v8.15
                   </span>
                 </div>
                 <p className="text-slate-400 text-[11px] mt-1 max-w-md">
@@ -165,7 +165,7 @@ export const ScriptExportModal: React.FC<ScriptExportModalProps> = ({
                   </div>
                   <div className="font-semibold text-white">Unzip Archive</div>
                   <p className="text-[11px] text-slate-400">
-                    Extract the downloaded <code className="text-cyan-300">apex-kilo-extension-v8.14.zip</code> to any folder on your computer.
+                    Extract the downloaded <code className="text-cyan-300">apex-kilo-extension-v8.15.zip</code> to any folder on your computer.
                   </p>
                 </div>
 
@@ -278,7 +278,7 @@ export const ScriptExportModal: React.FC<ScriptExportModalProps> = ({
             <div className="space-y-1.5">
               <div className="flex items-center justify-between text-[11px] text-slate-400">
                 <span>Script Header & Core Engine Preview</span>
-                <span className="font-mono text-cyan-400">v8.14.0</span>
+                <span className="font-mono text-cyan-400">v8.15.0</span>
               </div>
               <pre className="p-3.5 bg-slate-950 border border-slate-800 rounded-xl font-mono text-[10px] text-slate-300 overflow-x-auto max-h-48 leading-relaxed">
                 {scriptSnippet}

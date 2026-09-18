@@ -60,7 +60,7 @@ export const Header: React.FC<HeaderProps> = ({
               Apex Kilo Autonomous Agent
             </h1>
             <span className="text-[10px] font-mono px-1.5 py-0.5 bg-cyan-950/80 text-cyan-300 border border-cyan-700/60 rounded">
-              v8.14
+              v8.15
             </span>
             <span className="hidden md:inline-flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 bg-blue-950/80 text-blue-300 border border-blue-800/40 rounded-full">
               Browser Extension
